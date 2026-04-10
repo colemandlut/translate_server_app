@@ -9,7 +9,7 @@ import 'package:opus_dart/opus_dart.dart';
 import 'package:opus_flutter/opus_flutter.dart' as opus_flutter;
 import 'models/language.dart';
 
-const _defaultServerUrl = 'ws://192.168.5.59:8080';
+const _defaultServerUrl = 'wss://translate-relay.fly.dev';
 
 class TranscriptEntry {
   final String id;

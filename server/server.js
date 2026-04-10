@@ -22,7 +22,9 @@ function getSpeechClient() {
     keepCase: false, longs: String, enums: String, defaults: true, oneofs: true,
   });
   const proto = grpc.loadPackageDefinition(pkg).google.cloud.speech.v1;
-  speechClient = new proto.Speech('speech.googleapis.com:443', grpc.credentials.createSsl());
+  const endpoint = process.env.STT_ENDPOINT || 'speech.googleapis.com:443';
+  speechClient = new proto.Speech(endpoint, grpc.credentials.createSsl());
+  console.log('STT endpoint:', endpoint);
   return speechClient;
 }
 
@@ -152,7 +154,15 @@ class Session {
       if (ver !== this.streamVer) return;
       this.log('gRPC err: ' + err.message);
       this.stream = null;
-      if (this.active) setTimeout(() => this._openStream(), 1000);
+      // Exponential backoff: don't retry too fast
+      if (!this._retryCount) this._retryCount = 0;
+      this._retryCount++;
+      const delay = Math.min(1000 * this._retryCount, 10000);
+      if (this.active && this._retryCount < 10) {
+        setTimeout(() => this._openStream(), delay);
+      } else if (this._retryCount >= 10) {
+        this.log('Too many retries, giving up');
+      }
     });
 
     s.on('end', () => {
@@ -173,6 +183,10 @@ class Session {
       .map(r => r.alternatives[0].transcript)
       .join(' ').trim();
     if (!text) return;
+
+    this._retryCount = 0; // successful response, reset retry counter
+    const _r = resp.results[resp.results.length - 1];
+    this.log(_r.isFinal ? `FINAL: "${text.substring(0,40)}"` : `interim: "${text.substring(0,40)}"`);
 
     const last = resp.results[resp.results.length - 1];
     const isFinal = last.isFinal;
