@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+package google.cloud.speech.v1;
+
+service Speech {
+  rpc StreamingRecognize(stream StreamingRecognizeRequest) returns (stream StreamingRecognizeResponse);
+}
+
+message StreamingRecognizeRequest {
+  oneof streaming_request {
+    StreamingRecognitionConfig streaming_config = 1;
+    bytes audio_content = 2;
+  }
+}
+
+message StreamingRecognizeResponse {
+  repeated StreamingRecognitionResult results = 2;
+}
+
+message StreamingRecognitionConfig {
+  RecognitionConfig config = 1;
+  bool single_utterance = 2;
+  bool interim_results = 3;
+}
+
+message RecognitionConfig {
+  enum AudioEncoding {
+    ENCODING_UNSPECIFIED = 0;
+    LINEAR16 = 1;
+    FLAC = 2;
+    MULAW = 3;
+    AMR = 4;
+    AMR_WB = 5;
+    OGG_OPUS = 6;
+    SPEEX_WITH_HEADER_BYTE = 7;
+    WEBM_OPUS = 9;
+  }
+
+  AudioEncoding encoding = 1;
+  int32 sample_rate_hertz = 2;
+  string language_code = 3;
+  int32 max_alternatives = 4;
+  bool profanity_filter = 5;
+  repeated string alternative_language_codes = 18;
+  bool enable_automatic_punctuation = 11;
+  string model = 13;
+}
+
+message StreamingRecognitionResult {
+  repeated SpeechRecognitionAlternative alternatives = 1;
+  bool is_final = 2;
+  float stability = 3;
+  int32 channel_tag = 5;
+  string language_code = 6;
+}
+
+message SpeechRecognitionAlternative {
+  string transcript = 1;
+  float confidence = 2;
+}

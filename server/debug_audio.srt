@@ -1,0 +1,8 @@
+1
+00:00:00,000 --> 00:00:05,600
+Now what these models are, why they're such a huge leap forward, and what this all means
+
+2
+00:00:05,600 --> 00:00:10,800
+for everybody, from a solo-coder working on a passion project to a massive company.
+
