@@ -30,7 +30,7 @@ async function initSpeechClient() {
   speechProto = grpc.loadPackageDefinition(pkg).google.cloud.speech.v2;
   googleAuth = new GoogleAuth({ scopes: ['https://www.googleapis.com/auth/cloud-platform'] });
   cachedToken = await googleAuth.getAccessToken();
-  console.log('V2 Speech ready (chirp_3), token obtained');
+  console.log('V2 Speech ready (latest_long), token obtained');
 
   // Refresh token every 45 minutes
   setInterval(async () => {
@@ -48,9 +48,10 @@ function createSpeechClient() {
     cb(null, meta);
   });
   const creds = grpc.credentials.combineChannelCredentials(grpc.credentials.createSsl(), callCreds);
-  const region = process.env.STT_REGION || 'asia-northeast1';
-  console.log('STT region:', region);
-  return new speechProto.Speech(`${region}-speech.googleapis.com:443`, creds);
+  const region = process.env.STT_REGION || 'global';
+  const endpoint = region === 'global' ? 'speech.googleapis.com:443' : `${region}-speech.googleapis.com:443`;
+  console.log('STT region:', region, 'endpoint:', endpoint);
+  return new speechProto.Speech(endpoint, creds);
 }
 
 // ---- Translation (API Key) ----
@@ -107,7 +108,7 @@ function detectDirection(text, langA, langB) {
   return { spoken: langA, target: langB };
 }
 
-// ---- Session (V2 chirp_3) ----
+// ---- Session (V2 latest_long) ----
 let sid = 0;
 
 class Session {
@@ -146,7 +147,7 @@ class Session {
     const client = createSpeechClient();
 
     // V2 requires x-goog-request-params
-    const region = process.env.STT_REGION || 'asia-northeast1';
+    const region = process.env.STT_REGION || 'global';
     const recognizer = `projects/${PROJECT_ID}/locations/${region}/recognizers/_`;
     const meta = new grpc.Metadata();
     meta.add('x-goog-request-params', `recognizer=${recognizer}`);
@@ -159,7 +160,7 @@ class Session {
     const v2A = toV2Lang(this.langA);
     const v2B = toV2Lang(this.langB);
 
-    // V2 chirp_3 config (per docs: interim_results only, no VAD)
+    // V2 latest_long config (per docs: interim_results only, no VAD)
     s.write({
       streaming_config: {
         config: {
@@ -168,7 +169,7 @@ class Session {
             sample_rate_hertz: 16000,
             audio_channel_count: 1,
           },
-          model: process.env.STT_MODEL || 'chirp_3',
+          model: process.env.STT_MODEL || 'latest_long',
           language_codes: [v2A, v2B],
           features: {
             enable_automatic_punctuation: true,
@@ -213,7 +214,7 @@ class Session {
       if (this.active) setTimeout(() => this._openStream(), 300);
     });
 
-    this.log(`V2 #${ver}: [${v2A}, ${v2B}] model=chirp_3`);
+    this.log(`V2 #${ver}: [${v2A}, ${v2B}] model=latest_long`);
   }
 
   _onResponse(resp) {
@@ -356,7 +357,7 @@ async function main() {
     ws.on('error', () => { if (session) { session.stop(); session = null; } });
   });
 
-  console.log(`Translate relay V2 (chirp_3) on port ${PORT}`);
+  console.log(`Translate relay V2 (latest_long) on port ${PORT}`);
 }
 
 main().catch(e => { console.error('FATAL:', e.message); process.exit(1); });
