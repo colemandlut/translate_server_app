@@ -205,13 +205,27 @@ class _HomePageState extends State<HomePage>
     const frameSizeBytes = 640; // 20ms @ 16kHz 16bit mono
     List<int> pcmBuffer = [];
 
+    // VAD: energy threshold for silence detection (low threshold to not miss speech)
+    const int silenceThreshold = 50;
+
     _audioSub = audioStream.listen((data) {
       pcmBuffer.addAll(data);
       while (pcmBuffer.length >= frameSizeBytes) {
-        final frame = Int16List.view(
-          Uint8List.fromList(pcmBuffer.sublist(0, frameSizeBytes)).buffer,
-        );
+        final frameBytes = Uint8List.fromList(pcmBuffer.sublist(0, frameSizeBytes));
+        final frame = Int16List.view(frameBytes.buffer);
         pcmBuffer = pcmBuffer.sublist(frameSizeBytes);
+
+        // Simple VAD: calculate RMS energy of frame
+        double energy = 0;
+        for (int i = 0; i < frame.length; i++) {
+          energy += frame[i] * frame[i];
+        }
+        final rms = (energy / frame.length);
+        // rms > threshold^2 means speech detected
+        if (rms < silenceThreshold * silenceThreshold) {
+          continue; // skip silent frame
+        }
+
         try {
           final opusPacket = encoder.encode(input: frame);
           if (_wsChannel != null && opusPacket.isNotEmpty) {
@@ -246,6 +260,17 @@ class _HomePageState extends State<HomePage>
       try {
         _wsChannel!.sink.add(jsonEncode({'type': 'stop'}));
       } catch (_) {}
+    }
+
+    // If there's unsaved interim text, save it as a transcript entry
+    if (_liveText.isNotEmpty) {
+      _transcripts.add(TranscriptEntry(
+        id: DateTime.now().millisecondsSinceEpoch.toString(),
+        original: _liveText,
+        translated: _liveTranslation.isNotEmpty ? _liveTranslation : '...',
+        spokenLang: '',
+        translatedLang: '',
+      ));
     }
 
     setState(() {

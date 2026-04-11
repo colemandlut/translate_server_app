@@ -3,7 +3,7 @@ const grpc = require('@grpc/grpc-js');
 const protoLoader = require('@grpc/proto-loader');
 const https = require('https');
 const path = require('path');
-const OpusScript = require('opusscript');
+const { OggOpusWriter } = require('./ogg_opus');
 const { langName, transCode } = require('./lang_map');
 
 const API_KEY = process.env.GOOGLE_API_KEY || 'AIzaSyCTN5gvTBRAFmCiU_jFu1mV2N16fEeurCM';
@@ -12,7 +12,7 @@ const PORT = process.env.PORT || 8080;
 process.on('uncaughtException', (err) => console.error('UNCAUGHT:', err.message));
 process.on('unhandledRejection', (err) => console.error('UNHANDLED:', err));
 
-// ---- Google STT V1 (proven fast + reliable) ----
+// ---- Google STT V1 ----
 const PROTO_PATH = path.join(__dirname, 'google/cloud/speech/v1/cloud_speech.proto');
 let speechClient = null;
 
@@ -94,11 +94,14 @@ class Session {
     this.langB = 'zh-CN';
     this.stream = null;
     this.streamVer = 0;
-    this.decoder = null;
+    this.oggWriter = null;
     this.audioQueue = [];
-    this.interimTimer = null;
     this.lastInterimTranslated = '';
     this.silenceTimer = null;
+    this._retryCount = 0;
+    // Interim translation: track in-flight request to avoid piling up
+    this._interimTranslating = false;
+    this._pendingInterimText = null;
   }
 
   log(m) { console.log(`[${this.id}] ${m}`); }
@@ -107,9 +110,6 @@ class Session {
     this.langA = langA;
     this.langB = langB;
     this.active = true;
-    try { this.decoder = new OpusScript(16000, 1, OpusScript.Application.VOIP); } catch (e) {
-      this.log('Opus decoder fail: ' + e.message);
-    }
     this._openStream();
   }
 
@@ -125,10 +125,11 @@ class Session {
     catch (e) { this.log('gRPC fail: ' + e.message); return; }
     this.stream = s;
 
+    // OGG_OPUS encoding: send OGG headers first, then wrap each Opus frame
     s.write({
       streamingConfig: {
         config: {
-          encoding: 'LINEAR16',
+          encoding: 'OGG_OPUS',
           sampleRateHertz: 16000,
           languageCode: this.langA,
           alternativeLanguageCodes: [this.langB],
@@ -138,6 +139,11 @@ class Session {
         singleUtterance: false,
       },
     });
+
+    // Create OGG writer and send headers
+    this.oggWriter = new OggOpusWriter(16000, 1);
+    const headers = this.oggWriter.getHeaders();
+    try { s.write({ audioContent: headers }); } catch (_) {}
 
     // Flush queued audio
     while (this.audioQueue.length > 0) {
@@ -154,8 +160,6 @@ class Session {
       if (ver !== this.streamVer) return;
       this.log('gRPC err: ' + err.message);
       this.stream = null;
-      // Exponential backoff: don't retry too fast
-      if (!this._retryCount) this._retryCount = 0;
       this._retryCount++;
       const delay = Math.min(1000 * this._retryCount, 10000);
       if (this.active && this._retryCount < 10) {
@@ -172,7 +176,7 @@ class Session {
       if (this.active) setTimeout(() => this._openStream(), 300);
     });
 
-    this.log(`Stream #${ver}: ${this.langA} <-> ${this.langB}`);
+    this.log(`Stream #${ver}: ${this.langA} <-> ${this.langB} [OGG_OPUS]`);
   }
 
   _onResponse(resp) {
@@ -184,28 +188,31 @@ class Session {
       .join(' ').trim();
     if (!text) return;
 
-    this._retryCount = 0; // successful response, reset retry counter
-    const _r = resp.results[resp.results.length - 1];
-    this.log(_r.isFinal ? `FINAL: "${text.substring(0,40)}"` : `interim: "${text.substring(0,40)}"`);
-
+    this._retryCount = 0;
     const last = resp.results[resp.results.length - 1];
     const isFinal = last.isFinal;
     const detectedLang = last.languageCode || '';
 
     if (!isFinal) {
+      // Send interim text immediately
       this._send({ type: 'interim', text, lang: detectedLang });
-      if (this.interimTimer) clearTimeout(this.interimTimer);
-      this.interimTimer = setTimeout(() => this._translateInterim(text), 150);
+      // Translate every interim (non-blocking, skip if previous still in flight)
+      this._translateInterim(text);
       return;
     }
 
     this.log(`Final [${detectedLang}]: "${text.substring(0, 50)}"`);
-    if (this.interimTimer) { clearTimeout(this.interimTimer); this.interimTimer = null; }
     this._translateFinal(text, detectedLang);
   }
 
   async _translateInterim(text) {
     if (!this.active) return;
+    // If already translating, queue the latest text
+    if (this._interimTranslating) {
+      this._pendingInterimText = text;
+      return;
+    }
+    this._interimTranslating = true;
     try {
       const dir = detectDirection(text, this.langA, this.langB);
       const translated = await translateText(text, transCode(dir.target));
@@ -213,6 +220,14 @@ class Session {
       this.lastInterimTranslated = translated;
       this._send({ type: 'interim_translation', text, translated });
     } catch (_) {}
+    this._interimTranslating = false;
+
+    // If there's a newer pending interim, translate it now
+    if (this._pendingInterimText && this.active) {
+      const pending = this._pendingInterimText;
+      this._pendingInterimText = null;
+      this._translateInterim(pending);
+    }
   }
 
   async _translateFinal(text, detectedLang) {
@@ -226,6 +241,7 @@ class Session {
       translated = this.lastInterimTranslated || '[error]';
     }
     this.lastInterimTranslated = '';
+    this._pendingInterimText = null;
     this._send({
       type: 'final', text, translated,
       spokenLang: langName(dir.spoken),
@@ -247,6 +263,7 @@ class Session {
     if (this.silenceTimer) { clearTimeout(this.silenceTimer); this.silenceTimer = null; }
     const old = this.stream;
     this.stream = null;
+    this.oggWriter = null;
     this.audioQueue = [];
     if (old) try { old.end(); } catch (_) {}
     setTimeout(() => { if (this.active) this._openStream(); }, 100);
@@ -256,21 +273,19 @@ class Session {
     if (!this.active) return;
     if (this.silenceTimer) { clearTimeout(this.silenceTimer); this.silenceTimer = null; }
 
-    let pcm;
+    // Wrap raw Opus frame in OGG page (no decoding!)
+    let oggPage;
     try {
-      if (this.decoder) {
-        const decoded = this.decoder.decode(data, 320); // 20ms @ 16kHz
-        pcm = Buffer.from(decoded.buffer, decoded.byteOffset, decoded.byteLength);
-      } else {
-        pcm = data;
-      }
+      if (this.oggWriter) {
+        oggPage = this.oggWriter.wrapFrame(data);
+      } else { return; }
     } catch (_) { return; }
 
     if (this.stream) {
-      try { this.stream.write({ audioContent: pcm }); }
-      catch (_) { this.audioQueue.push(pcm); }
+      try { this.stream.write({ audioContent: oggPage }); }
+      catch (_) { this.audioQueue.push(oggPage); }
     } else {
-      this.audioQueue.push(pcm);
+      this.audioQueue.push(oggPage);
       const total = this.audioQueue.reduce((s, b) => s + b.length, 0);
       while (total > 64000 && this.audioQueue.length > 1) this.audioQueue.shift();
     }
@@ -279,11 +294,10 @@ class Session {
   stop() {
     this.active = false;
     this.streamVer++;
-    if (this.interimTimer) clearTimeout(this.interimTimer);
     if (this.silenceTimer) clearTimeout(this.silenceTimer);
     if (this.stream) try { this.stream.end(); } catch (_) {}
     this.stream = null;
-    this.decoder = null;
+    this.oggWriter = null;
     this.audioQueue = [];
     this.log('Stopped');
   }
@@ -314,4 +328,4 @@ wss.on('connection', (ws) => {
   ws.on('close', () => { if (session) { session.stop(); session = null; } console.log('Disconnected'); });
   ws.on('error', () => { if (session) { session.stop(); session = null; } });
 });
-console.log(`Translate relay V1 on port ${PORT}`);
+console.log(`Translate relay V1 [OGG_OPUS] on port ${PORT}`);
