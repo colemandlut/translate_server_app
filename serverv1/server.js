@@ -99,9 +99,14 @@ class Session {
     this.lastInterimTranslated = '';
     this.silenceTimer = null;
     this._retryCount = 0;
-    // Interim translation: track in-flight request to avoid piling up
     this._interimTranslating = false;
     this._pendingInterimText = null;
+    // Early final: detect unchanged interim text
+    this._lastInterimText = '';
+    this._lastInterimLang = '';
+    this._earlyFinalTimer = null;
+    this._earlyFinalSent = false;
+    this._earlyFinalText = '';
   }
 
   log(m) { console.log(`[${this.id}] ${m}`); }
@@ -194,14 +199,48 @@ class Session {
     const detectedLang = last.languageCode || '';
 
     if (!isFinal) {
-      // Send interim text immediately
+      this._lastInterimTime = Date.now();
       this._send({ type: 'interim', text, lang: detectedLang });
-      // Translate every interim (non-blocking, skip if previous still in flight)
       this._translateInterim(text);
+
+      // Early final: if interim text unchanged for 800ms, send as final
+      if (text === this._lastInterimText) {
+        // Same text, start timer if not already running
+        if (!this._earlyFinalTimer) {
+          this._earlyFinalTimer = setTimeout(() => {
+            if (this.active && !this._earlyFinalSent && this._lastInterimText) {
+              this.log(`Early final (800ms unchanged): "${this._lastInterimText.substring(0, 40)}"`);
+              this._sendEarlyFinal(this._lastInterimText, this._lastInterimLang);
+            }
+          }, 800);
+        }
+      } else {
+        // Text changed, reset timer
+        if (this._earlyFinalTimer) { clearTimeout(this._earlyFinalTimer); this._earlyFinalTimer = null; }
+        this._earlyFinalSent = false;
+      }
+      this._lastInterimText = text;
+      this._lastInterimLang = detectedLang;
       return;
     }
 
-    this.log(`Final [${detectedLang}]: "${text.substring(0, 50)}"`);
+    // Google's real Final
+    if (this._earlyFinalTimer) { clearTimeout(this._earlyFinalTimer); this._earlyFinalTimer = null; }
+    const now = Date.now();
+    const gap = now - (this._lastInterimTime || now);
+
+    if (this._earlyFinalSent && this._earlyFinalText === text) {
+      // Already sent as early final, skip
+      this.log(`Final skipped (early sent) gap=${gap}ms`);
+      this._earlyFinalSent = false;
+      this._lastInterimText = '';
+      this._scheduleSilenceRestart();
+      return;
+    }
+
+    this.log(`Final gap=${gap}ms [${detectedLang}]: "${text.substring(0, 50)}"`);
+    this._earlyFinalSent = false;
+    this._lastInterimText = '';
     this._translateFinal(text, detectedLang);
   }
 
@@ -228,6 +267,23 @@ class Session {
       this._pendingInterimText = null;
       this._translateInterim(pending);
     }
+  }
+
+  _sendEarlyFinal(text, detectedLang) {
+    const dir = detectDirection(text, this.langA, this.langB);
+    // Use cached interim translation (already available)
+    const translated = this.lastInterimTranslated || '...';
+    this._send({
+      type: 'final', text, translated,
+      spokenLang: langName(dir.spoken),
+      translatedLang: langName(dir.target),
+      detectedLang,
+    });
+    this._earlyFinalSent = true;
+    this._earlyFinalText = text;
+    this.lastInterimTranslated = '';
+    this._pendingInterimText = null;
+    this._scheduleSilenceRestart();
   }
 
   async _translateFinal(text, detectedLang) {
@@ -295,6 +351,7 @@ class Session {
     this.active = false;
     this.streamVer++;
     if (this.silenceTimer) clearTimeout(this.silenceTimer);
+    if (this._earlyFinalTimer) clearTimeout(this._earlyFinalTimer);
     if (this.stream) try { this.stream.end(); } catch (_) {}
     this.stream = null;
     this.oggWriter = null;
