@@ -283,7 +283,8 @@ class Session {
     this._earlyFinalText = text;
     this.lastInterimTranslated = '';
     this._pendingInterimText = null;
-    this._scheduleSilenceRestart();
+    // Restart stream immediately for fresh language detection
+    this._restart();
   }
 
   async _translateFinal(text, detectedLang) {
@@ -304,7 +305,8 @@ class Session {
       translatedLang: langName(dir.target),
       detectedLang,
     });
-    this._scheduleSilenceRestart();
+    // Restart stream for fresh language detection
+    this._restart();
   }
 
   _scheduleSilenceRestart() {
@@ -317,6 +319,8 @@ class Session {
   _restart() {
     if (!this.active) return;
     if (this.silenceTimer) { clearTimeout(this.silenceTimer); this.silenceTimer = null; }
+    if (this._earlyFinalTimer) { clearTimeout(this._earlyFinalTimer); this._earlyFinalTimer = null; }
+    this.streamVer++; // invalidate old stream callbacks BEFORE ending
     const old = this.stream;
     this.stream = null;
     this.oggWriter = null;

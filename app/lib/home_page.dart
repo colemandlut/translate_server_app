@@ -40,8 +40,8 @@ class _HomePageState extends State<HomePage>
   bool _isConnected = false;
   bool _isListening = false;
 
-  Language _langA = languages[2]; // English
-  Language _langB = languages[0]; // Chinese
+  Language _langA = languages[0]; // Chinese
+  Language _langB = languages[3]; // Japanese
   final List<TranscriptEntry> _transcripts = [];
   String _liveText = '';
   String _liveTranslation = '';
