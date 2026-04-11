@@ -1,0 +1,99 @@
+syntax = "proto3";
+
+package google.cloud.speech.v2;
+
+import "google/protobuf/duration.proto";
+
+service Speech {
+  rpc StreamingRecognize(stream StreamingRecognizeRequest) returns (stream StreamingRecognizeResponse);
+}
+
+message StreamingRecognizeRequest {
+  string recognizer = 3;
+  oneof streaming_request {
+    StreamingRecognitionConfig streaming_config = 6;
+    bytes audio = 5;
+  }
+}
+
+message StreamingRecognitionConfig {
+  RecognitionConfig config = 1;
+  StreamingRecognitionFeatures streaming_features = 2;
+}
+
+message StreamingRecognitionFeatures {
+  bool enable_voice_activity_events = 1;
+  bool interim_results = 2;
+  VoiceActivityTimeout voice_activity_timeout = 3;
+
+  enum EndpointingSensitivity {
+    ENDPOINTING_SENSITIVITY_UNSPECIFIED = 0;
+    ENDPOINTING_SENSITIVITY_STANDARD = 1;
+    ENDPOINTING_SENSITIVITY_SUPERSHORT = 2;
+    ENDPOINTING_SENSITIVITY_SHORT = 3;
+  }
+  EndpointingSensitivity endpointing_sensitivity = 8;
+
+  message VoiceActivityTimeout {
+    google.protobuf.Duration speech_start_timeout = 1;
+    google.protobuf.Duration speech_end_timeout = 2;
+  }
+}
+
+message RecognitionConfig {
+  oneof decoding_config {
+    AutoDetectDecodingConfig auto_decoding_config = 7;
+    ExplicitDecodingConfig explicit_decoding_config = 8;
+  }
+  string model = 9;
+  repeated string language_codes = 10;
+  RecognitionFeatures features = 2;
+}
+
+message AutoDetectDecodingConfig {}
+
+message ExplicitDecodingConfig {
+  enum AudioEncoding {
+    AUDIO_ENCODING_UNSPECIFIED = 0;
+    LINEAR16 = 1;
+    MULAW = 5;
+    ALAW = 6;
+  }
+  AudioEncoding encoding = 1;
+  int32 sample_rate_hertz = 2;
+  int32 audio_channel_count = 3;
+}
+
+message RecognitionFeatures {
+  bool enable_word_time_offsets = 6;
+  bool enable_automatic_punctuation = 11;
+}
+
+message StreamingRecognizeResponse {
+  repeated StreamingRecognitionResult results = 6;
+  SpeechEventType speech_event_type = 3;
+  StreamingRecognitionMetadata metadata = 5;
+
+  enum SpeechEventType {
+    SPEECH_EVENT_TYPE_UNSPECIFIED = 0;
+    END_OF_SINGLE_UTTERANCE = 1;
+    SPEECH_ACTIVITY_BEGIN = 2;
+    SPEECH_ACTIVITY_END = 3;
+    SPEECH_ACTIVITY_TIMEOUT = 4;
+  }
+}
+
+message StreamingRecognitionMetadata {
+}
+
+message StreamingRecognitionResult {
+  repeated SpeechRecognitionAlternative alternatives = 1;
+  bool is_final = 2;
+  float stability = 3;
+  string language_code = 5;
+}
+
+message SpeechRecognitionAlternative {
+  string transcript = 1;
+  float confidence = 2;
+}
