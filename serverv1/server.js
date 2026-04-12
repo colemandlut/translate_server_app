@@ -98,6 +98,8 @@ class Session {
     this.audioQueue = [];
     this.lastInterimTranslated = '';
     this.silenceTimer = null;
+    this._lastResponseTime = 0;  // track last response from Google
+    this._stuckTimer = null;     // detect stuck streams
     this._retryCount = 0;
     this._interimTranslating = false;
     this._pendingInterimText = null;
@@ -121,6 +123,10 @@ class Session {
   _openStream() {
     if (!this.active) return;
     const ver = ++this.streamVer;
+    this._lastResponseTime = Date.now();
+    this._earlyFinalSent = false;
+    this._lastInterimText = '';
+    this._streamStartTime = Date.now(); // cooldown for ghost interims
 
     const meta = new grpc.Metadata();
     meta.add('x-goog-api-key', API_KEY);
@@ -194,18 +200,24 @@ class Session {
     if (!text) return;
 
     this._retryCount = 0;
+    this._lastResponseTime = Date.now();
     const last = resp.results[resp.results.length - 1];
     const isFinal = last.isFinal;
     const detectedLang = last.languageCode || '';
 
     if (!isFinal) {
+      // Skip ghost interims in first 500ms after stream restart (echo/noise)
+      if (Date.now() - this._streamStartTime < 500) return;
+
       this._lastInterimTime = Date.now();
+      this.log(`interim: "${text.substring(0, 40)}"`);
       this._send({ type: 'interim', text, lang: detectedLang });
       this._translateInterim(text);
 
-      // Early final: if interim text unchanged for 800ms, send as final
-      if (text === this._lastInterimText) {
-        // Same text, start timer if not already running
+      // Early final: if interim text unchanged for 800ms, send as final (once per stream)
+      if (this._earlyFinalSent) {
+        // Already sent early final on this stream, just forward interim
+      } else if (text === this._lastInterimText) {
         if (!this._earlyFinalTimer) {
           this._earlyFinalTimer = setTimeout(() => {
             if (this.active && !this._earlyFinalSent && this._lastInterimText) {
@@ -217,7 +229,6 @@ class Session {
       } else {
         // Text changed, reset timer
         if (this._earlyFinalTimer) { clearTimeout(this._earlyFinalTimer); this._earlyFinalTimer = null; }
-        this._earlyFinalSent = false;
       }
       this._lastInterimText = text;
       this._lastInterimLang = detectedLang;
@@ -229,12 +240,11 @@ class Session {
     const now = Date.now();
     const gap = now - (this._lastInterimTime || now);
 
-    if (this._earlyFinalSent && this._earlyFinalText === text) {
-      // Already sent as early final, skip
+    if (this._earlyFinalSent) {
+      // Early final already handled this sentence, skip regardless of text
       this.log(`Final skipped (early sent) gap=${gap}ms`);
       this._earlyFinalSent = false;
       this._lastInterimText = '';
-      this._scheduleSilenceRestart();
       return;
     }
 
@@ -325,13 +335,28 @@ class Session {
     this.stream = null;
     this.oggWriter = null;
     this.audioQueue = [];
+    // Open new stream FIRST, then close old (zero gap)
+    this._openStream();
     if (old) try { old.end(); } catch (_) {}
-    setTimeout(() => { if (this.active) this._openStream(); }, 100);
   }
 
   audio(data) {
     if (!this.active) return;
     if (this.silenceTimer) { clearTimeout(this.silenceTimer); this.silenceTimer = null; }
+
+    // Detect stuck stream: sending audio but no response for 5s
+    if (this._lastResponseTime > 0 && this.stream) {
+      const sinceLastResponse = Date.now() - this._lastResponseTime;
+      if (sinceLastResponse > 5000 && !this._stuckTimer) {
+        this._stuckTimer = setTimeout(() => {
+          if (this.active && this.stream) {
+            this.log('Stream stuck (5s no response), restarting');
+            this._restart();
+          }
+          this._stuckTimer = null;
+        }, 100);
+      }
+    }
 
     // Wrap raw Opus frame in OGG page (no decoding!)
     let oggPage;
@@ -356,6 +381,7 @@ class Session {
     this.streamVer++;
     if (this.silenceTimer) clearTimeout(this.silenceTimer);
     if (this._earlyFinalTimer) clearTimeout(this._earlyFinalTimer);
+    if (this._stuckTimer) { clearTimeout(this._stuckTimer); this._stuckTimer = null; }
     if (this.stream) try { this.stream.end(); } catch (_) {}
     this.stream = null;
     this.oggWriter = null;

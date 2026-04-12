@@ -10,6 +10,7 @@ import 'package:opus_flutter/opus_flutter.dart' as opus_flutter;
 import 'models/language.dart';
 
 const _defaultServerUrl = 'wss://translate-relay.fly.dev';
+const _appVersion = 'v1.2.0';
 
 class TranscriptEntry {
   final String id;
@@ -205,26 +206,13 @@ class _HomePageState extends State<HomePage>
     const frameSizeBytes = 640; // 20ms @ 16kHz 16bit mono
     List<int> pcmBuffer = [];
 
-    // VAD: energy threshold for silence detection (low threshold to not miss speech)
-    const int silenceThreshold = 50;
-
     _audioSub = audioStream.listen((data) {
       pcmBuffer.addAll(data);
       while (pcmBuffer.length >= frameSizeBytes) {
-        final frameBytes = Uint8List.fromList(pcmBuffer.sublist(0, frameSizeBytes));
-        final frame = Int16List.view(frameBytes.buffer);
+        final frame = Int16List.view(
+          Uint8List.fromList(pcmBuffer.sublist(0, frameSizeBytes)).buffer,
+        );
         pcmBuffer = pcmBuffer.sublist(frameSizeBytes);
-
-        // Simple VAD: calculate RMS energy of frame
-        double energy = 0;
-        for (int i = 0; i < frame.length; i++) {
-          energy += frame[i] * frame[i];
-        }
-        final rms = (energy / frame.length);
-        // rms > threshold^2 means speech detected
-        if (rms < silenceThreshold * silenceThreshold) {
-          continue; // skip silent frame
-        }
 
         try {
           final opusPacket = encoder.encode(input: frame);
@@ -302,16 +290,39 @@ class _HomePageState extends State<HomePage>
         });
         _scrollToBottom();
       } else if (type == 'final') {
+        final finalText = msg['text'] as String? ?? '';
+        final translated = msg['translated'] as String? ?? '';
+        final spokenLang = msg['spokenLang'] as String? ?? '';
+        final translatedLang = msg['translatedLang'] as String? ?? '';
+
+        // Check if this is a duplicate of the last transcript (early final + real final)
+        final isDuplicate = _transcripts.isNotEmpty &&
+            _transcripts.last.original == finalText;
+
         setState(() {
           _liveText = '';
           _liveTranslation = '';
-          _transcripts.add(TranscriptEntry(
-            id: DateTime.now().millisecondsSinceEpoch.toString(),
-            original: msg['text'] as String? ?? '',
-            translated: msg['translated'] as String? ?? '',
-            spokenLang: msg['spokenLang'] as String? ?? '',
-            translatedLang: msg['translatedLang'] as String? ?? '',
-          ));
+          if (isDuplicate) {
+            // Update translation of last entry (early final may have had '...')
+            if (translated.isNotEmpty && translated != '...') {
+              final last = _transcripts.removeLast();
+              _transcripts.add(TranscriptEntry(
+                id: last.id,
+                original: last.original,
+                translated: translated,
+                spokenLang: spokenLang.isNotEmpty ? spokenLang : last.spokenLang,
+                translatedLang: translatedLang.isNotEmpty ? translatedLang : last.translatedLang,
+              ));
+            }
+          } else {
+            _transcripts.add(TranscriptEntry(
+              id: DateTime.now().millisecondsSinceEpoch.toString(),
+              original: finalText,
+              translated: translated,
+              spokenLang: spokenLang,
+              translatedLang: translatedLang,
+            ));
+          }
         });
         _scrollToBottom();
       }
@@ -446,12 +457,21 @@ class _HomePageState extends State<HomePage>
                   const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
               child: Row(
                 children: [
-                  const Expanded(
-                    child: Text('Real-time Translator',
-                        style: TextStyle(
-                            fontSize: 22,
-                            fontWeight: FontWeight.bold,
-                            color: Color(0xFFe0e0ff))),
+                  Expanded(
+                    child: Row(
+                      children: [
+                        const Text('Real-time Translator',
+                            style: TextStyle(
+                                fontSize: 22,
+                                fontWeight: FontWeight.bold,
+                                color: Color(0xFFe0e0ff))),
+                        const SizedBox(width: 8),
+                        Text(_appVersion,
+                            style: const TextStyle(
+                                fontSize: 11,
+                                color: Color(0xFF7f8fa6))),
+                      ],
+                    ),
                   ),
                   // Connection indicator
                   Container(
