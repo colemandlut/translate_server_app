@@ -3,8 +3,14 @@ const grpc = require('@grpc/grpc-js');
 const protoLoader = require('@grpc/proto-loader');
 const https = require('https');
 const path = require('path');
+const fs = require('fs');
 const { OggOpusWriter } = require('./ogg_opus');
 const { langName, transCode } = require('./lang_map');
+
+// Audio debug: save each utterance's OGG data
+const SAVE_AUDIO = process.env.SAVE_AUDIO === '1';
+const AUDIO_DIR = path.join(__dirname, 'audio_debug');
+if (SAVE_AUDIO && !fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR);
 
 const API_KEY = process.env.GOOGLE_API_KEY || 'AIzaSyCTN5gvTBRAFmCiU_jFu1mV2N16fEeurCM';
 const PORT = process.env.PORT || 8080;
@@ -98,8 +104,10 @@ class Session {
     this.audioQueue = [];
     this.lastInterimTranslated = '';
     this.silenceTimer = null;
-    this._lastResponseTime = 0;  // track last response from Google
-    this._stuckTimer = null;     // detect stuck streams
+    this._lastResponseTime = 0;
+    this._stuckTimer = null;
+    this._audioChunks = [];      // buffer OGG pages for current utterance
+    this._utteranceCount = 0;
     this._retryCount = 0;
     this._interimTranslating = false;
     this._pendingInterimText = null;
@@ -154,6 +162,7 @@ class Session {
     // Create OGG writer and send headers
     this.oggWriter = new OggOpusWriter(16000, 1);
     const headers = this.oggWriter.getHeaders();
+    this._oggHeader = headers; // save for audio debug
     try { s.write({ audioContent: headers }); } catch (_) {}
 
     // Flush queued audio
@@ -249,6 +258,7 @@ class Session {
     }
 
     this.log(`Final gap=${gap}ms [${detectedLang}]: "${text.substring(0, 50)}"`);
+    this._saveAudio(text);
     this._earlyFinalSent = false;
     this._lastInterimText = '';
     this._translateFinal(text, detectedLang);
@@ -279,7 +289,35 @@ class Session {
     }
   }
 
+  _saveAudio(text) {
+    if (!SAVE_AUDIO || this._audioChunks.length === 0) return;
+    this._utteranceCount++;
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const label = text.substring(0, 20).replace(/[^\w\u4e00-\u9fff\u3040-\u30ff]/g, '');
+    const filename = `${ts}_${this._utteranceCount}_${label}.ogg`;
+    const filepath = path.join(AUDIO_DIR, filename);
+    // Save raw Opus frames as proper OGG file with matching serial
+    const writer = new OggOpusWriter(16000, 1);
+    const parts = [writer.getHeaders()];
+    for (const chunk of this._audioChunks) {
+      // chunk is already an OGG page from the stream writer, but serial differs
+      // Re-wrap: extract Opus payload from raw data and wrap with new writer
+      // Simpler: just save the raw Opus frames directly
+    }
+    // Actually, _audioChunks contains OGG pages from the stream's oggWriter.
+    // Those pages have the correct serial. We need the ORIGINAL header from that writer.
+    // But the writer may have been replaced by restart. Save the header at stream open time.
+    if (this._oggHeader) {
+      fs.writeFileSync(filepath, Buffer.concat([this._oggHeader, ...this._audioChunks]));
+    } else {
+      fs.writeFileSync(filepath, Buffer.concat(this._audioChunks));
+    }
+    this.log(`Saved audio: ${filename} (${this._audioChunks.length} frames)`);
+    this._audioChunks = [];
+  }
+
   _sendEarlyFinal(text, detectedLang) {
+    this._saveAudio(text);
     const dir = detectDirection(text, this.langA, this.langB);
     // Use cached interim translation (already available)
     const translated = this.lastInterimTranslated || '...';
@@ -351,6 +389,7 @@ class Session {
         this._stuckTimer = setTimeout(() => {
           if (this.active && this.stream) {
             this.log('Stream stuck (5s no response), restarting');
+            this._saveAudio('[stuck]');
             this._restart();
           }
           this._stuckTimer = null;
@@ -365,6 +404,9 @@ class Session {
         oggPage = this.oggWriter.wrapFrame(data);
       } else { return; }
     } catch (_) { return; }
+
+    // Save audio for debugging
+    if (SAVE_AUDIO) this._audioChunks.push(Buffer.from(oggPage));
 
     if (this.stream) {
       try { this.stream.write({ audioContent: oggPage }); }

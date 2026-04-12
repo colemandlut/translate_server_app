@@ -1,0 +1,14 @@
+{
+  "name": "translate-relay-whisper",
+  "version": "1.0.0",
+  "description": "WebSocket relay: Opus -> Groq Whisper (STT) -> Google Translate",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "opusscript": "^0.1.1",
+    "ws": "^8.18.0"
+  }
+}
