@@ -7,6 +7,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:opus_dart/opus_dart.dart';
 import 'package:opus_flutter/opus_flutter.dart' as opus_flutter;
+import 'package:wakelock_plus/wakelock_plus.dart';
 import 'models/language.dart';
 
 const _defaultServerUrl = 'wss://translate-relay.fly.dev';
@@ -97,11 +98,12 @@ class _HomePageState extends State<HomePage>
   void _scrollToBottom() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (_scrollController.hasClients) {
-        _scrollController.animateTo(
-          _scrollController.position.maxScrollExtent,
-          duration: const Duration(milliseconds: 200),
-          curve: Curves.easeOut,
-        );
+        final max = _scrollController.position.maxScrollExtent;
+        final current = _scrollController.position.pixels;
+        // Only scroll down, never up
+        if (max > current) {
+          _scrollController.jumpTo(max);
+        }
       }
     });
   }
@@ -232,6 +234,7 @@ class _HomePageState extends State<HomePage>
       _liveTranslation = '';
     });
     _pulseController.repeat(reverse: true);
+    WakelockPlus.enable(); // keep screen on while listening
   }
 
   Future<void> _stopListening() async {
@@ -260,6 +263,8 @@ class _HomePageState extends State<HomePage>
         translatedLang: '',
       ));
     }
+
+    WakelockPlus.disable(); // allow screen to sleep again
 
     setState(() {
       _isListening = false;
@@ -295,16 +300,13 @@ class _HomePageState extends State<HomePage>
         final spokenLang = msg['spokenLang'] as String? ?? '';
         final translatedLang = msg['translatedLang'] as String? ?? '';
 
-        // Check if this is a duplicate of the last transcript (early final + real final)
         final isDuplicate = _transcripts.isNotEmpty &&
             _transcripts.last.original == finalText;
 
-        setState(() {
-          _liveText = '';
-          _liveTranslation = '';
-          if (isDuplicate) {
-            // Update translation of last entry (early final may have had '...')
-            if (translated.isNotEmpty && translated != '...') {
+        if (isDuplicate) {
+          // Update translation only, no layout change
+          if (translated.isNotEmpty && translated != '...') {
+            setState(() {
               final last = _transcripts.removeLast();
               _transcripts.add(TranscriptEntry(
                 id: last.id,
@@ -313,8 +315,12 @@ class _HomePageState extends State<HomePage>
                 spokenLang: spokenLang.isNotEmpty ? spokenLang : last.spokenLang,
                 translatedLang: translatedLang.isNotEmpty ? translatedLang : last.translatedLang,
               ));
-            }
-          } else {
+            });
+          }
+        } else {
+          setState(() {
+            _liveText = '';
+            _liveTranslation = '';
             _transcripts.add(TranscriptEntry(
               id: DateTime.now().millisecondsSinceEpoch.toString(),
               original: finalText,
@@ -322,9 +328,24 @@ class _HomePageState extends State<HomePage>
               spokenLang: spokenLang,
               translatedLang: translatedLang,
             ));
-          }
-        });
+          });
+        }
         _scrollToBottom();
+      } else if (type == 'update_last') {
+        // Fragment merged into last card
+        if (_transcripts.isNotEmpty) {
+          setState(() {
+            final last = _transcripts.removeLast();
+            _transcripts.add(TranscriptEntry(
+              id: last.id,
+              original: msg['text'] as String? ?? last.original,
+              translated: msg['translated'] as String? ?? last.translated,
+              spokenLang: msg['spokenLang'] as String? ?? last.spokenLang,
+              translatedLang: msg['translatedLang'] as String? ?? last.translatedLang,
+            ));
+          });
+          _scrollToBottom();
+        }
       }
     } catch (e) {
       debugPrint('Parse error: $e');
@@ -554,28 +575,38 @@ class _HomePageState extends State<HomePage>
               ),
             ),
 
-            // Transcript list
+            // Transcript list + live area
             Expanded(
-              child: ListView(
-                controller: _scrollController,
-                padding: const EdgeInsets.all(16),
+              child: Column(
                 children: [
-                  if (_transcripts.isEmpty &&
-                      _liveText.isEmpty &&
-                      !_isListening)
+                  // Scrollable card list (reverse: new items appear at bottom without shifting old ones)
+                  Expanded(
+                    child: _transcripts.isEmpty && _liveText.isEmpty && !_isListening
+                        ? Center(
+                            child: Text(
+                              _isConnected
+                                  ? 'Speak in either language\nauto-detect & translate'
+                                  : 'Connecting to server...',
+                              textAlign: TextAlign.center,
+                              style: const TextStyle(
+                                  color: Color(0xFF7f8fa6), fontSize: 16),
+                            ),
+                          )
+                        : ListView.builder(
+                            controller: _scrollController,
+                            padding: const EdgeInsets.all(16),
+                            itemCount: _transcripts.length,
+                            itemBuilder: (context, index) {
+                              return _buildEntry(_transcripts[index]);
+                            },
+                          ),
+                  ),
+                  // Live area fixed at bottom (outside ListView)
+                  if (_liveText.isNotEmpty)
                     Padding(
-                      padding: const EdgeInsets.only(top: 100),
-                      child: Text(
-                        _isConnected
-                            ? 'Speak in either language\nauto-detect & translate'
-                            : 'Connecting to server...',
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(
-                            color: Color(0xFF7f8fa6), fontSize: 16),
-                      ),
+                      padding: const EdgeInsets.symmetric(horizontal: 16),
+                      child: _buildLive(),
                     ),
-                  ..._transcripts.map(_buildEntry),
-                  if (_liveText.isNotEmpty) _buildLive(),
                 ],
               ),
             ),
@@ -683,6 +714,7 @@ class _HomePageState extends State<HomePage>
 
   Widget _buildEntry(TranscriptEntry entry) {
     return Container(
+      key: ValueKey(entry.id),
       margin: const EdgeInsets.only(bottom: 12),
       decoration: BoxDecoration(borderRadius: BorderRadius.circular(12)),
       clipBehavior: Clip.antiAlias,
@@ -736,6 +768,7 @@ class _HomePageState extends State<HomePage>
 
   Widget _buildLive() {
     return Container(
+      key: const ValueKey('__live__'),
       margin: const EdgeInsets.only(bottom: 12),
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(12),

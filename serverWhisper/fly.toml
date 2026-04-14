@@ -1,0 +1,20 @@
+app = "translate-relay-whisper"
+primary_region = "nrt"
+
+[build]
+
+[env]
+  PORT = "8080"
+  WHISPER_URL = "https://api.deepinfra.com"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+[[vm]]
+  memory = "256mb"
+  cpu_kind = "shared"
+  cpus = 1

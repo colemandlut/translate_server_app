@@ -1,9 +1,37 @@
 const { Server: WebSocketServer } = require('ws');
 const https = require('https');
+const http = require('http');
 const path = require('path');
 const OpusScript = require('opusscript');
 
-const http = require('http');
+// WebRTC VAD (WASM)
+let fvadModule = null;
+async function initFvad() {
+  const mod = await import('@echogarden/fvad-wasm');
+  fvadModule = await mod.default();
+  console.log('WebRTC VAD (fvad-wasm) loaded');
+}
+
+function createVad() {
+  if (!fvadModule) return null;
+  const ptr = fvadModule._fvad_new();
+  fvadModule._fvad_set_sample_rate(ptr, 16000);
+  fvadModule._fvad_set_mode(ptr, 3); // mode 3 = most aggressive (least false positives)
+  return {
+    isVoice(pcmInt16Array) {
+      // pcmInt16Array: Int16Array of 160 samples (10ms @ 16kHz)
+      const byteLen = pcmInt16Array.length * 2;
+      const bufPtr = fvadModule._malloc(byteLen);
+      fvadModule.HEAP16.set(pcmInt16Array, bufPtr >> 1);
+      const result = fvadModule._fvad_process(ptr, bufPtr, pcmInt16Array.length);
+      fvadModule._free(bufPtr);
+      return result === 1; // 1 = voice, 0 = silence, -1 = error
+    },
+    free() {
+      fvadModule._fvad_free(ptr);
+    }
+  };
+}
 const WHISPER_API_KEY = process.env.WHISPER_API_KEY || process.env.GROQ_API_KEY || '';
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY || 'AIzaSyCTN5gvTBRAFmCiU_jFu1mV2N16fEeurCM';
 const PORT = process.env.PORT || 8080;
@@ -95,11 +123,28 @@ function transcribeAudio(wavBuffer, language) {
   });
 }
 
-// Dual-language transcription: send both langA and langB in parallel, pick best
-async function transcribeDual(wavBuffer, langA, langB) {
-  const aCode = langA.split('-')[0].toLowerCase(); // 'zh-CN' -> 'zh'
-  const bCode = langB.split('-')[0].toLowerCase(); // 'ja-JP' -> 'ja'
+// Dual-language transcription with language lock optimization
+// First 2 interims send both languages. If both agree, lock to that language.
+let _lockedLang = null;
+let _lockCount = 0;
 
+function resetLangLock() {
+  _lockedLang = null;
+  _lockCount = 0;
+}
+
+async function transcribeDual(wavBuffer, langA, langB) {
+  const aCode = langA.split('-')[0].toLowerCase();
+  const bCode = langB.split('-')[0].toLowerCase();
+
+  // If language is locked (2 consecutive same detections), use single request
+  if (_lockedLang) {
+    const result = await transcribeAudio(wavBuffer, _lockedLang).catch(() => null);
+    if (result && result.text.length >= 2) return result;
+    return { text: '', language: '' };
+  }
+
+  // Send both languages in parallel
   const [resultA, resultB] = await Promise.all([
     transcribeAudio(wavBuffer, aCode).catch(() => null),
     transcribeAudio(wavBuffer, bCode).catch(() => null),
@@ -118,7 +163,23 @@ async function transcribeDual(wavBuffer, langA, langB) {
   if (!aValid && !bValid) return { text: '', language: '' };
 
   // Both valid: pick higher avg_logprob (closer to 0)
-  return resultA.avgLogProb > resultB.avgLogProb ? resultA : resultB;
+  const winner = resultA.avgLogProb > resultB.avgLogProb ? resultA : resultB;
+  const winnerLang = winner === resultA ? aCode : bCode;
+
+  // Track consecutive same-language wins for locking
+  if (winnerLang === _lockedLang || _lockCount === 0) {
+    _lockCount++;
+    if (_lockCount >= 2) {
+      _lockedLang = winnerLang;
+      console.log(`[lang-lock] Locked to "${winnerLang}" after ${_lockCount} consecutive wins`);
+    }
+  } else {
+    _lockCount = 1;
+  }
+  // Store last winner for tracking
+  _lockedLang = _lockCount >= 2 ? winnerLang : null;
+
+  return winner;
 }
 
 // ---- Google Translation ----
@@ -164,14 +225,20 @@ const HALLUCINATION_PATTERNS = [
   'ありがとうございました', 'ありがとうございます',
   'お疲れ様でした', 'それでは', 'では',
   '谢谢', '谢谢观看', '感谢收看',
+  'so', 'okay', 'ok', 'whole', 'well', 'right',
+  'はい', 'ではでは', 'じゃあ',
 ];
 
 function isHallucination(text, detectedLang, langA, langB) {
-  const lower = text.toLowerCase().trim();
+  // Strip all punctuation and prefix symbols for comparison
+  const stripped = text.toLowerCase().trim()
+    .replace(/^[-–—*#•「」『』\s]+/, '')  // strip leading symbols
+    .replace(/[.,!?。、！？…\s]+$/g, '')   // strip trailing punctuation
+    .trim();
   // Check common hallucination phrases
-  if (HALLUCINATION_PATTERNS.some(p => lower === p || lower === p + '.')) return true;
-  // Very short text (< 4 chars) is likely noise
-  if (lower.length < 4) return true;
+  if (HALLUCINATION_PATTERNS.some(p => stripped === p)) return true;
+  // Very short text (< 4 chars after stripping) is likely noise/fragment
+  if (stripped.length < 4) return true;
   // If detected language doesn't match either langA or langB, likely hallucination
   const det = (detectedLang || '').toLowerCase();
   const mapped = WHISPER_LANG_MAP[det] || det;
@@ -232,6 +299,7 @@ class Session {
     this.langA = 'en-US';
     this.langB = 'zh-CN';
     this.decoder = null;
+    this._vad = null;
 
     this._allBuffers = [];     // all PCM for current utterance
     this._isSpeaking = false;
@@ -241,6 +309,9 @@ class Session {
     this._interimBusy = false;
     this._lastInterimText = '';
     this._lastInterimLang = '';
+    this._consecutiveHallucinations = 0;
+    this._vadPaused = false;
+    this._vadPauseTimer = null;
   }
 
   log(m) { console.log(`[${this.id}] ${m}`); }
@@ -249,6 +320,7 @@ class Session {
     this.langA = langA;
     this.langB = langB;
     this.active = true;
+    this._vad = createVad();
     try { this.decoder = new OpusScript(16000, 1, OpusScript.Application.VOIP); } catch (e) {
       this.log('Opus fail: ' + e.message);
     }
@@ -258,20 +330,38 @@ class Session {
   audio(data) {
     if (!this.active || !this.decoder) return;
 
+    // If 3+ consecutive hallucinations, pause VAD for 3 seconds
+    if (this._consecutiveHallucinations >= 3 && !this._vadPaused) {
+      this._vadPaused = true;
+      this._resetVAD();
+      this.log(`VAD paused (${this._consecutiveHallucinations} hallucinations)`);
+      if (this._vadPauseTimer) clearTimeout(this._vadPauseTimer);
+      this._vadPauseTimer = setTimeout(() => {
+        this._vadPaused = false;
+        this._consecutiveHallucinations = 0;
+        this.log('VAD resumed');
+      }, 3000);
+      return;
+    }
+    if (this._vadPaused) return;
+
     let pcm;
     try {
       const decoded = this.decoder.decode(data, 320);
       pcm = Buffer.from(decoded.buffer, decoded.byteOffset, decoded.byteLength);
     } catch (_) { return; }
 
-    // RMS energy
-    let energy = 0;
-    for (let i = 0; i < pcm.length; i += 2) {
-      const s = pcm.readInt16LE(i);
-      energy += s * s;
+    // WebRTC VAD: process 10ms frames (160 samples)
+    // Our Opus frame = 20ms = 320 samples, split into 2 x 10ms
+    let voiceFrames = 0;
+    const samples = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.length / 2);
+    if (this._vad) {
+      for (let i = 0; i + 160 <= samples.length; i += 160) {
+        const frame = samples.subarray(i, i + 160);
+        if (this._vad.isVoice(frame)) voiceFrames++;
+      }
     }
-    const rms = Math.sqrt(energy / (pcm.length / 2));
-    const isSpeech = rms > SILENCE_THRESHOLD;
+    const isSpeech = voiceFrames > 0; // at least one 10ms frame has voice
     const now = Date.now();
 
     if (isSpeech) {
@@ -336,10 +426,12 @@ class Session {
       const text = result.text;
       if (text && text.length >= 2 && text !== this._lastInterimText) {
         if (isHallucination(text, result.language, this.langA, this.langB)) {
-          this.log(`interim SKIP hallucination (${ms}ms): "${text.substring(0, 40)}"`);
+          this._consecutiveHallucinations++;
+          this.log(`interim SKIP hallucination #${this._consecutiveHallucinations} (${ms}ms): "${text.substring(0, 40)}"`);
           this._interimBusy = false;
           return;
         }
+        this._consecutiveHallucinations = 0;
         this._lastInterimText = text;
         this._lastInterimLang = result.language;
         this.log(`interim (${ms}ms): "${text.substring(0, 40)}"`);
@@ -362,11 +454,13 @@ class Session {
   }
 
   async _doFinal() {
+    if (!this.active || this._finalizing) return;
+    this._finalizing = true;
     this._stopInterimPolling();
     const buffers = this._allBuffers;
     this._resetVAD();
 
-    if (buffers.length < 10) return;
+    if (buffers.length < 10) { this._finalizing = false; return; }
 
     const durationMs = buffers.length * 20;
     this.log(`Final transcribing ${durationMs}ms...`);
@@ -382,13 +476,39 @@ class Session {
 
       const text = result.text;
       if (!text || text.length < 2 || isHallucination(text, result.language, this.langA, this.langB)) {
-        this.log(`Empty/hallucination (${ms}ms): "${(text||'').substring(0,30)}"`);
+        this._consecutiveHallucinations++;
+        this.log(`Empty/hallucination #${this._consecutiveHallucinations} (${ms}ms): "${(text||'').substring(0,30)}"`);
         this._send({ type: 'interim', text: '', lang: '' });
-        this._send({ type: 'interim', text: '', lang: '' });
+        this._finalizing = false;
         return;
       }
 
       const detectedLang = result.language;
+      const now = Date.now();
+
+      // Fragment merging: short text soon after last final → append to previous
+      const isFragment = text.length < 30 && this._lastFinalTime && (now - this._lastFinalTime < 2000);
+      if (isFragment && this._lastFinalText) {
+        const merged = this._lastFinalText + ' ' + text;
+        this.log(`Fragment merged (${ms}ms): "${text}" → "${merged.substring(0, 50)}"`);
+
+        const dir = detectDirection(detectedLang, this.langA, this.langB);
+        const translated = await translateText(merged, transCode(dir.target));
+
+        // Send update (app will replace last card)
+        this._send({
+          type: 'update_last', text: merged, translated,
+          spokenLang: langName(dir.spoken),
+          translatedLang: langName(dir.target),
+          detectedLang,
+        });
+        this._lastFinalText = merged;
+        this._lastFinalTime = now;
+        this._finalizing = false;
+        return;
+      }
+
+      this._consecutiveHallucinations = 0; // real speech detected
       this.log(`Final [${detectedLang}] (${ms}ms): "${text.substring(0, 50)}"`);
 
       // Send interim text first
@@ -397,6 +517,9 @@ class Session {
       // Translate
       const dir = detectDirection(detectedLang, this.langA, this.langB);
       const translated = await translateText(text, transCode(dir.target));
+
+      this._lastFinalText = text;
+      this._lastFinalTime = now;
 
       this._send({
         type: 'final', text, translated,
@@ -408,6 +531,7 @@ class Session {
       this.log('Final err: ' + e.message);
       this._send({ type: 'interim', text: '', lang: '' });
     }
+    this._finalizing = false;
   }
 
   _resetVAD() {
@@ -416,15 +540,20 @@ class Session {
     this._speechStartTime = 0;
     this._silenceStartTime = 0;
     this._stopInterimPolling();
+    resetLangLock(); // next utterance: re-detect language
   }
 
   async stop() {
+    this.active = false; // FIRST: block all audio processing
     this._stopInterimPolling();
-    if (this._isSpeaking && this._allBuffers.length > 10) {
-      await this._doFinal();
-    }
-    this.active = false;
     this.decoder = null;
+    if (this._vad) { this._vad.free(); this._vad = null; }
+    // Process last utterance if any
+    if (this._isSpeaking && this._allBuffers.length > 10) {
+      this.active = true; // temporarily re-enable for final send
+      await this._doFinal();
+      this.active = false;
+    }
     this.log('Stopped');
   }
 
@@ -438,6 +567,9 @@ const whisperTarget = WHISPER_URL.includes('localhost') ? 'Local' :
   WHISPER_URL.includes('groq') ? 'Groq' :
   WHISPER_URL.includes('deepinfra') ? 'DeepInfra' : 'Custom';
 console.log('Whisper backend:', whisperTarget, WHISPER_URL);
+
+// Init WebRTC VAD before starting server
+initFvad().catch(e => console.error('VAD init failed:', e.message));
 
 const wss = new WebSocketServer({ port: PORT });
 wss.on('connection', (ws) => {
