@@ -10,7 +10,7 @@ import 'package:opus_flutter/opus_flutter.dart' as opus_flutter;
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'models/language.dart';
 
-const _defaultServerUrl = 'wss://translate-relay.fly.dev';
+const _defaultServerUrl = 'wss://translate-relay-whisper.fly.dev';
 const _appVersion = 'v1.2.0';
 
 class TranscriptEntry {
