@@ -148,7 +148,7 @@ X-DashScope-DataInspection: enable
 }
 ```
 
-**2) 音频帧（binary frame）**：解码后的 PCM 16k 16bit mono，按 ~100ms 一片（≈3200 字节）持续上行。**必须等到收到 `task-started` 之后才开始送音频**，避免丢首包。
+**2) 音频帧（binary frame）**：解码后的 PCM 16k 16bit mono，按 ~100ms 一片（≈3200 字节）持续上行。**必须等到收到 `task-started` 之后才开始往 DashScope 上行**，避免丢首包。在此之前 app 已经送来的 PCM 在 server 内存里短缓冲（实测 `task-started` 通常 100–300ms 内到达，缓冲量 < 10KB，无需限长）；`task-started` 一到立即把缓冲全部 flush 上行，之后切换为实时透传。
 
 **3) `finish-task`（text frame，结束）**
 
@@ -163,7 +163,7 @@ X-DashScope-DataInspection: enable
 
 | 事件 | 处理 |
 |---|---|
-| `task-started` | 标记 ready，开始把缓存的 / 后续的 PCM 上行 |
+| `task-started` | 标记 ready，flush 短缓冲并切换到实时透传（详见 §4.2） |
 | `result-generated` | 见 §4.4 |
 | `task-finished` | 关闭 app 侧 ws（如果还开着） |
 | `task-failed` | log error，给 app 推空 final 收尾，关 ws |
@@ -179,6 +179,7 @@ X-DashScope-DataInspection: enable
 - `sentence_end === false` → `app.send({type:"interim", text, lang})`
   - `lang` 取自 DashScope 返回的语言识别字段（若无则透传 `start` 时 app 传的 `sourceLang`）
 - `sentence_end === true` → 调 `translateText(text, targetLang)` → `app.send({type:"final", text, translated, lang})`
+  - `translateText` 直接从 `serverWhisper/server.js` 复制过来（不抽共用 lib，YAGNI）；签名与行为保持一致，方便未来同步 bugfix
 
 ### 4.5 首词延迟预算
 
