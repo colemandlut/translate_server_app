@@ -23,6 +23,53 @@ console.log(`[boot] serverDashscope on :${PORT}`);
 console.log(`[boot] model=${DASHSCOPE_MODEL} languages=${DASHSCOPE_LANGUAGES.join(',')}`);
 console.log(`[boot] ws_url=${DASHSCOPE_WS_URL}${DASHSCOPE_WORKSPACE_ID ? ` workspace=${DASHSCOPE_WORKSPACE_ID}` : ''}`);
 
+// ---- Translation (copied from serverWhisper/server.js, lines 186-213) ----
+const https = require('https');
+
+function translateText(text, targetLang) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('timeout')), 8000);
+    const body = JSON.stringify({ q: text, target: targetLang, format: 'text' });
+    const req = https.request({
+      hostname: 'translation.googleapis.com',
+      path: `/language/translate/v2?key=${GOOGLE_API_KEY}`,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+      timeout: 8000,
+    }, (res) => {
+      let d = '';
+      res.on('data', (c) => d += c);
+      res.on('end', () => {
+        clearTimeout(timer);
+        try {
+          const j = JSON.parse(d);
+          if (j.error) return reject(new Error(j.error.message));
+          resolve(j.data.translations[0].translatedText);
+        } catch (e) { reject(e); }
+      });
+    });
+    req.on('error', (e) => { clearTimeout(timer); reject(e); });
+    req.on('timeout', () => req.destroy());
+    req.write(body);
+    req.end();
+  });
+}
+
+// ---- Bilingual direction ----
+// transCode: BCP-47 -> Google Translate `target` form
+function transCode(c) { return c.toLowerCase() === 'zh-tw' ? 'zh-TW' : c.split('-')[0]; }
+
+// detectDirection: pick {spoken, target} from {langA, langB} given detected lang
+// detectedLang is the short form returned by detectLang() (e.g. "zh", "en")
+function detectDirection(detectedLang, langA, langB) {
+  const det = (detectedLang || '').toLowerCase();
+  const aShort = langA.split('-')[0].toLowerCase();
+  const bShort = langB.split('-')[0].toLowerCase();
+  if (det === bShort) return { spoken: langB, target: langA };
+  if (det === aShort) return { spoken: langA, target: langB };
+  return { spoken: langA, target: langB }; // fallback
+}
+
 // ---- DashScope client ----
 const WebSocket = require('ws');
 const { randomUUID } = require('crypto');
@@ -186,13 +233,21 @@ class Session {
     this._frameCount = 0;
     this.dashscope = new DashscopeStream({
       onPartial: (text) => {
-        const lang = detectLang(text);
-        this.send({ type: 'interim', text, lang });
+        const detected = detectLang(text);
+        const dir = detectDirection(detected, this.langA, this.langB);
+        this.send({ type: 'interim', text, lang: dir.spoken });
       },
-      onFinal: (text) => {
-        const lang = detectLang(text);
-        // Translation arrives in Task 6 — for now emit final with empty translated
-        this.send({ type: 'final', text, translated: '', lang });
+      onFinal: async (text) => {
+        const detected = detectLang(text);
+        const dir = detectDirection(detected, this.langA, this.langB);
+        let translated = '';
+        try {
+          translated = await translateText(text, transCode(dir.target));
+        } catch (e) {
+          console.error('[translate] failed:', e.message);
+        }
+        // Use spoken (BCP-47, e.g. zh-CN) as the lang field — matches serverWhisper behavior
+        this.send({ type: 'final', text, translated, lang: dir.spoken });
       },
       onError: (err) => { console.error('[session] dashscope error:', err.message); },
     });
