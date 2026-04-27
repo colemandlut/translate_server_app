@@ -101,7 +101,9 @@ const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY || '';
 const DASHSCOPE_MODEL = process.env.DASHSCOPE_MODEL || 'paraformer-realtime-v2';
 const DASHSCOPE_LANGUAGES = (process.env.DASHSCOPE_LANGUAGES || 'zh,en')
   .split(',').map((s) => s.trim()).filter(Boolean);
-const DASHSCOPE_WS_URL = 'wss://dashscope.aliyuncs.com/api-ws/v1/inference/';
+const DASHSCOPE_WS_URL = process.env.DASHSCOPE_WS_URL
+  || 'wss://dashscope.aliyuncs.com/api-ws/v1/inference/';
+const DASHSCOPE_WORKSPACE_ID = process.env.DASHSCOPE_WORKSPACE_ID || '';
 
 if (!DASHSCOPE_API_KEY) {
   console.error('FATAL: DASHSCOPE_API_KEY is required'); process.exit(1);
@@ -115,6 +117,7 @@ process.on('unhandledRejection', (err) => console.error('UNHANDLED:', err));
 
 console.log(`[boot] serverDashscope on :${PORT}`);
 console.log(`[boot] model=${DASHSCOPE_MODEL} languages=${DASHSCOPE_LANGUAGES.join(',')}`);
+console.log(`[boot] ws_url=${DASHSCOPE_WS_URL}${DASHSCOPE_WORKSPACE_ID ? ` workspace=${DASHSCOPE_WORKSPACE_ID}` : ''}`);
 ```
 
 - [ ] **Step 1.4: Create `serverDashscope/.env.example`**
@@ -128,6 +131,11 @@ GOOGLE_API_KEY=AIzaSy...              # Same key as serverWhisper
 PORT=8082                             # Avoids 8080 (v1/v2/Whisper) and 8081 (Moonshine)
 DASHSCOPE_MODEL=paraformer-realtime-v2
 DASHSCOPE_LANGUAGES=zh,en
+
+# Workspace endpoint (REQUIRED if your key belongs to a non-default DashScope workspace —
+# e.g. a cn-beijing private MaaS deployment). Leave both unset to use public DashScope.
+DASHSCOPE_WS_URL=wss://ws-0aeifgnnem2sw62m.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference/
+DASHSCOPE_WORKSPACE_ID=ws-0aeifgnnem2sw62m
 ```
 
 - [ ] **Step 1.5: Smoke — fail-fast on missing env**
@@ -138,7 +146,7 @@ Expected: prints `FATAL: DASHSCOPE_API_KEY is required` and exits with code 1.
 - [ ] **Step 1.6: Smoke — boot succeeds with env set**
 
 Run: `cd serverDashscope && DASHSCOPE_API_KEY=stub GOOGLE_API_KEY=stub node server.js`
-Expected: prints two `[boot]` lines, then process hangs (no listener yet — kill with Ctrl-C).
+Expected: prints three `[boot]` lines (port, model+languages, ws_url), then process hangs (no listener yet — kill with Ctrl-C). The `ws_url` line shows the public default unless you set `DASHSCOPE_WS_URL`/`DASHSCOPE_WORKSPACE_ID`.
 
 - [ ] **Step 1.7: Verify `.gitignore` already excludes `node_modules`**
 
@@ -304,12 +312,12 @@ class DashscopeStream {
   }
 
   connect() {
-    this.ws = new WebSocket(DASHSCOPE_WS_URL, {
-      headers: {
-        'Authorization': `Bearer ${DASHSCOPE_API_KEY}`,
-        'X-DashScope-DataInspection': 'enable',
-      },
-    });
+    const headers = {
+      'Authorization': `Bearer ${DASHSCOPE_API_KEY}`,
+      'X-DashScope-DataInspection': 'enable',
+    };
+    if (DASHSCOPE_WORKSPACE_ID) headers['X-DashScope-WorkSpace'] = DASHSCOPE_WORKSPACE_ID;
+    this.ws = new WebSocket(DASHSCOPE_WS_URL, { headers });
     this.ws.on('open', () => {
       console.log(`[dashscope] ws open, task_id=${this.taskId}`);
       this._sendRunTask();
@@ -959,6 +967,7 @@ Expected boot output (no `[latency]` lines should ever appear during a session n
 ```
 [boot] serverDashscope on :8082
 [boot] model=paraformer-realtime-v2 languages=zh,en
+[boot] ws_url=wss://ws-0aeifgnnem2sw62m.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference/ workspace=ws-0aeifgnnem2sw62m
 [ws] listening on :8082 — point Flutter app at ws://<lan-ip>:8082
 [boot] ready (DashScope paraformer-realtime-v2, langs zh+en)
 ```
