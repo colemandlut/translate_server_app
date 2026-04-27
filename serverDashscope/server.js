@@ -23,19 +23,19 @@ console.log(`[boot] serverDashscope on :${PORT}`);
 console.log(`[boot] model=${DASHSCOPE_MODEL} languages=${DASHSCOPE_LANGUAGES.join(',')}`);
 console.log(`[boot] ws_url=${DASHSCOPE_WS_URL}${DASHSCOPE_WORKSPACE_ID ? ` workspace=${DASHSCOPE_WORKSPACE_ID}` : ''}`);
 
-// ---- Translation (copied from serverWhisper/server.js, lines 186-213) ----
+// ---- Translation (copied from serverWhisper/server.js — keep in sync) ----
 const https = require('https');
 
 function translateText(text, targetLang) {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('timeout')), 8000);
+    const timer = setTimeout(() => reject(new Error('timeout')), 3000);
     const body = JSON.stringify({ q: text, target: targetLang, format: 'text' });
     const req = https.request({
       hostname: 'translation.googleapis.com',
       path: `/language/translate/v2?key=${GOOGLE_API_KEY}`,
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-      timeout: 8000,
+      timeout: 3000,
     }, (res) => {
       let d = '';
       res.on('data', (c) => d += c);
@@ -238,16 +238,20 @@ class Session {
         this.send({ type: 'interim', text, lang: dir.spoken });
       },
       onFinal: async (text) => {
-        const detected = detectLang(text);
-        const dir = detectDirection(detected, this.langA, this.langB);
-        let translated = '';
         try {
-          translated = await translateText(text, transCode(dir.target));
+          const detected = detectLang(text);
+          const dir = detectDirection(detected, this.langA, this.langB);
+          let translated = '';
+          try {
+            translated = await translateText(text, transCode(dir.target));
+          } catch (e) {
+            console.error('[translate] failed:', e.message);
+          }
+          // Use spoken (BCP-47, e.g. zh-CN) as the lang field — matches serverWhisper behavior
+          this.send({ type: 'final', text, translated, lang: dir.spoken });
         } catch (e) {
-          console.error('[translate] failed:', e.message);
+          console.error('[session] onFinal error:', e.message);
         }
-        // Use spoken (BCP-47, e.g. zh-CN) as the lang field — matches serverWhisper behavior
-        this.send({ type: 'final', text, translated, lang: dir.spoken });
       },
       onError: (err) => { console.error('[session] dashscope error:', err.message); },
     });
