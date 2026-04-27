@@ -153,10 +153,11 @@ class DashscopeStream {
 
 // ---- Language direction (script-based) ----
 function detectLang(text) {
-  // BCP-47-ish; covers the languages defined in app/lib/models/language.dart.
-  if (/[一-鿿]/.test(text)) return 'zh';
-  if (/[぀-ヿ]/.test(text)) return 'ja';
+  // ISO 639-1 short codes; expanded to BCP-47 by detectDirection in Task 6.
+  // Order matters: kana proves Japanese before any CJK ideograph test.
+  if (/[぀-ヿ]/.test(text)) return 'ja';   // kana proves Japanese
   if (/[가-힯]/.test(text)) return 'ko';
+  if (/[一-鿿]/.test(text)) return 'zh';   // CJK ideographs after kana check
   if (/[Ѐ-ӿ]/.test(text)) return 'ru';
   if (/[؀-ۿ]/.test(text)) return 'ar';
   if (/[฀-๿]/.test(text)) return 'th';
