@@ -87,6 +87,7 @@ class DashscopeStream {
     this._pcmBuffer = []; // PCM chunks received before task-started
     this._connectTimer = null;
     this._finishTimer = null;
+    this._errored = false;
   }
 
   connect() {
@@ -99,7 +100,7 @@ class DashscopeStream {
     this._connectTimer = setTimeout(() => {
       if (!this.ready) {
         console.error('[dashscope] connect timeout (5s)');
-        this.onError && this.onError(new Error('dashscope connect timeout'));
+        this._callError(new Error('dashscope connect timeout'));
         try { this.ws.terminate(); } catch (_) {}
       }
     }, 5000);
@@ -111,7 +112,7 @@ class DashscopeStream {
     this.ws.on('message', (data, isBinary) => this._onMessage(data, isBinary));
     this.ws.on('error', (e) => {
       console.error('[dashscope] ws error:', e.message);
-      this.onError && this.onError(e);
+      this._callError(e);
     });
     this.ws.on('close', (code, reason) => {
       this.closed = true;
@@ -179,6 +180,7 @@ class DashscopeStream {
       }
     } else if (event === 'task-finished') {
       console.log('[dashscope] task-finished');
+      clearTimeout(this._connectTimer);
       clearTimeout(this._finishTimer);
       try { this.ws.close(); } catch (_) {}
     } else if (event === 'task-failed') {
@@ -186,8 +188,14 @@ class DashscopeStream {
       const errMsg = (msg.header && msg.header.error_message) || 'unknown';
       console.error(`[dashscope] task-failed: code=${code} message=${errMsg}`);
       clearTimeout(this._finishTimer);
-      this.onError && this.onError(new Error(`${code}: ${errMsg}`));
+      this._callError(new Error(`${code}: ${errMsg}`));
     }
+  }
+
+  _callError(err) {
+    if (this._errored) return;
+    this._errored = true;
+    this.onError && this.onError(err);
   }
 
   sendAudio(pcmChunk) {
