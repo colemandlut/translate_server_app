@@ -760,6 +760,12 @@ git commit -m "serverDashscope: bilingual direction + Google Translate integrati
 **Files:**
 - Modify: `serverDashscope/server.js`
 
+**Reviewer follow-ups carried over from Task 3** (fold into the steps below — pick whichever step is the natural home for each):
+
+- **Outbound WS connect timeout** — in `DashscopeStream.connect()`, set a watchdog `setTimeout(() => { if (!this.ready) { onError(new Error('dashscope connect timeout')); ws.terminate(); } }, 5000)`, store the handle, clear it inside the `task-started` branch. Without this, an unreachable DashScope endpoint leaves the session silently dead.
+- **`finish()` timer cleanup** — store the 200ms close-fallback handle (`this._finishTimer`), clear it inside the `'close'` listener, and `unref()` it so it doesn't keep the event loop alive after a clean session.
+- **Surface `error_code` on `task-failed`** — in `_onMessage`, also extract `msg.header.error_code` and include it in both the `console.error` log and the `Error` passed to `onError` (e.g. `new Error(\`${code}: ${message}\`)`). This makes diagnostics actionable when paraformer rejects auth, model access, or quota.
+
 - [ ] **Step 7.1: On `task-failed`, send empty final to app and close session**
 
 In `Session.start()`, replace the `onError` lambda with:

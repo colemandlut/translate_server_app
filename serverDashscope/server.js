@@ -109,12 +109,14 @@ class DashscopeStream {
 
   finish() {
     if (this.closed || !this.ws) return;
-    try {
-      this.ws.send(JSON.stringify({
-        header: { action: 'finish-task', task_id: this.taskId, streaming: 'duplex' },
-        payload: { input: {} },
-      }));
-    } catch (e) { console.error('[dashscope] finish error:', e.message); }
+    if (this.ws.readyState === WebSocket.OPEN) {
+      try {
+        this.ws.send(JSON.stringify({
+          header: { action: 'finish-task', task_id: this.taskId, streaming: 'duplex' },
+          payload: { input: {} },
+        }));
+      } catch (e) { console.error('[dashscope] finish error:', e.message); }
+    }
     setTimeout(() => { try { this.ws.close(); } catch (_) {} }, 200);
   }
 }
