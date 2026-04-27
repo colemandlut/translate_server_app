@@ -99,7 +99,18 @@ class DashscopeStream {
         this._pcmBuffer = [];
       }
     } else if (event === 'result-generated') {
-      // Result handling arrives in Task 5
+      const sentence = msg.payload && msg.payload.output && msg.payload.output.sentence;
+      if (!sentence) return;
+      const text = (sentence.text || '').trim();
+      if (!text) return;
+      // Sentence-final signal: end_time non-null OR explicit sentence_end flag
+      const isFinal = (sentence.end_time !== null && sentence.end_time !== undefined)
+                   || sentence.sentence_end === true;
+      if (isFinal) {
+        this.onFinal && this.onFinal(text);
+      } else {
+        this.onPartial && this.onPartial(text);
+      }
     } else if (event === 'task-finished') {
       console.log('[dashscope] task-finished');
     } else if (event === 'task-failed') {
@@ -140,7 +151,20 @@ class DashscopeStream {
   }
 }
 
-// ---- Per-app session (DashScope wiring comes in Task 3) ----
+// ---- Language direction (script-based) ----
+function detectLang(text) {
+  // BCP-47-ish; covers the languages defined in app/lib/models/language.dart.
+  if (/[一-鿿]/.test(text)) return 'zh';
+  if (/[぀-ヿ]/.test(text)) return 'ja';
+  if (/[가-힯]/.test(text)) return 'ko';
+  if (/[Ѐ-ӿ]/.test(text)) return 'ru';
+  if (/[؀-ۿ]/.test(text)) return 'ar';
+  if (/[฀-๿]/.test(text)) return 'th';
+  if (/[ऀ-ॿ]/.test(text)) return 'hi';
+  return 'en'; // default for Latin-script
+}
+
+// ---- Per-app session ----
 const { Server: WebSocketServer } = require('ws');
 const OpusScript = require('opusscript');
 
@@ -160,8 +184,15 @@ class Session {
     this.active = true;
     this._frameCount = 0;
     this.dashscope = new DashscopeStream({
-      onPartial: (text, lang) => {/* Task 5 */},
-      onFinal: (text, lang) => {/* Task 5 */},
+      onPartial: (text) => {
+        const lang = detectLang(text);
+        this.send({ type: 'interim', text, lang });
+      },
+      onFinal: (text) => {
+        const lang = detectLang(text);
+        // Translation arrives in Task 6 — for now emit final with empty translated
+        this.send({ type: 'final', text, translated: '', lang });
+      },
       onError: (err) => { console.error('[session] dashscope error:', err.message); },
     });
     this.dashscope.connect();
