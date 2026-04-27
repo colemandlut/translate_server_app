@@ -67,7 +67,8 @@ function detectDirection(detectedLang, langA, langB) {
   const bShort = langB.split('-')[0].toLowerCase();
   if (det === bShort) return { spoken: langB, target: langA };
   if (det === aShort) return { spoken: langA, target: langB };
-  return { spoken: langA, target: langB }; // fallback
+  console.warn(`[direction] detected ${det || '<empty>'} matches neither ${langA}/${langB}, defaulting to A`);
+  return { spoken: langA, target: langB };
 }
 
 // ---- DashScope client ----
@@ -84,6 +85,8 @@ class DashscopeStream {
     this.ready = false;
     this.closed = false;
     this._pcmBuffer = []; // PCM chunks received before task-started
+    this._connectTimer = null;
+    this._finishTimer = null;
   }
 
   connect() {
@@ -93,6 +96,14 @@ class DashscopeStream {
     };
     if (DASHSCOPE_WORKSPACE_ID) headers['X-DashScope-WorkSpace'] = DASHSCOPE_WORKSPACE_ID;
     this.ws = new WebSocket(DASHSCOPE_WS_URL, { headers });
+    this._connectTimer = setTimeout(() => {
+      if (!this.ready) {
+        console.error('[dashscope] connect timeout (5s)');
+        this.onError && this.onError(new Error('dashscope connect timeout'));
+        try { this.ws.terminate(); } catch (_) {}
+      }
+    }, 5000);
+    this._connectTimer.unref();
     this.ws.on('open', () => {
       console.log(`[dashscope] ws open, task_id=${this.taskId}`);
       this._sendRunTask();
@@ -104,6 +115,8 @@ class DashscopeStream {
     });
     this.ws.on('close', (code, reason) => {
       this.closed = true;
+      clearTimeout(this._connectTimer);
+      clearTimeout(this._finishTimer);
       console.log(`[dashscope] ws closed code=${code} reason=${reason}`);
     });
   }
@@ -138,9 +151,15 @@ class DashscopeStream {
     if (event === 'task-started') {
       console.log('[dashscope] task-started');
       this.ready = true;
+      clearTimeout(this._connectTimer);
       if (this._pcmBuffer.length > 0) {
+        let sendFailed = false;
         for (const buf of this._pcmBuffer) {
-          try { this.ws.send(buf, { binary: true }); } catch (_) {}
+          try { this.ws.send(buf, { binary: true }); }
+          catch (e) {
+            if (!sendFailed) { console.error('[dashscope] flush send failed:', e.message); sendFailed = true; }
+            break;
+          }
         }
         console.log(`[dashscope] flushed ${this._pcmBuffer.length} buffered chunks on ready`);
         this._pcmBuffer = [];
@@ -160,10 +179,14 @@ class DashscopeStream {
       }
     } else if (event === 'task-finished') {
       console.log('[dashscope] task-finished');
+      clearTimeout(this._finishTimer);
+      try { this.ws.close(); } catch (_) {}
     } else if (event === 'task-failed') {
-      const err = (msg.header && msg.header.error_message) || 'unknown';
-      console.error('[dashscope] task-failed:', err);
-      this.onError && this.onError(new Error(err));
+      const code = (msg.header && msg.header.error_code) || 'unknown';
+      const errMsg = (msg.header && msg.header.error_message) || 'unknown';
+      console.error(`[dashscope] task-failed: code=${code} message=${errMsg}`);
+      clearTimeout(this._finishTimer);
+      this.onError && this.onError(new Error(`${code}: ${errMsg}`));
     }
   }
 
@@ -175,8 +198,13 @@ class DashscopeStream {
     }
     if (this._pcmBuffer.length > 0) {
       // Flush buffer in order, then drop the buffer
+      let sendFailed = false;
       for (const buf of this._pcmBuffer) {
-        try { this.ws.send(buf, { binary: true }); } catch (_) {}
+        try { this.ws.send(buf, { binary: true }); }
+        catch (e) {
+          if (!sendFailed) { console.error('[dashscope] flush send failed:', e.message); sendFailed = true; }
+          break;
+        }
       }
       console.log(`[dashscope] flushed ${this._pcmBuffer.length} buffered chunks`);
       this._pcmBuffer = [];
@@ -194,7 +222,8 @@ class DashscopeStream {
         }));
       } catch (e) { console.error('[dashscope] finish error:', e.message); }
     }
-    setTimeout(() => { try { this.ws.close(); } catch (_) {} }, 200);
+    this._finishTimer = setTimeout(() => { try { this.ws.close(); } catch (_) {} }, 1500);
+    this._finishTimer.unref();
   }
 }
 
@@ -224,6 +253,7 @@ class Session {
     this.langB = 'zh-CN';
     this.active = false;
     this._frameCount = 0;
+    this._finalChain = Promise.resolve();
   }
 
   start(langA, langB) {
@@ -237,23 +267,31 @@ class Session {
         const dir = detectDirection(detected, this.langA, this.langB);
         this.send({ type: 'interim', text, lang: dir.spoken });
       },
-      onFinal: async (text) => {
-        try {
-          const detected = detectLang(text);
-          const dir = detectDirection(detected, this.langA, this.langB);
-          let translated = '';
+      onFinal: (text) => {
+        // Serialize on a per-session promise chain so concurrent finals from DashScope's
+        // sentence splitter emit in order even when Google Translate latencies vary.
+        this._finalChain = this._finalChain.then(async () => {
           try {
-            translated = await translateText(text, transCode(dir.target));
+            const detected = detectLang(text);
+            const dir = detectDirection(detected, this.langA, this.langB);
+            let translated = '';
+            try {
+              translated = await translateText(text, transCode(dir.target));
+            } catch (e) {
+              console.error('[translate] failed:', e.message);
+            }
+            // Use spoken (BCP-47, e.g. zh-CN) as the lang field — matches serverWhisper behavior
+            this.send({ type: 'final', text, translated, lang: dir.spoken });
           } catch (e) {
-            console.error('[translate] failed:', e.message);
+            console.error('[session] onFinal error:', e.message);
           }
-          // Use spoken (BCP-47, e.g. zh-CN) as the lang field — matches serverWhisper behavior
-          this.send({ type: 'final', text, translated, lang: dir.spoken });
-        } catch (e) {
-          console.error('[session] onFinal error:', e.message);
-        }
+        });
       },
-      onError: (err) => { console.error('[session] dashscope error:', err.message); },
+      onError: (err) => {
+        console.error('[session] dashscope error:', err.message);
+        this.send({ type: 'final', text: '', translated: '', lang: this.langA });
+        this.active = false;
+      },
     });
     this.dashscope.connect();
     console.log(`[session] start langA=${this.langA} langB=${this.langB}`);
@@ -316,4 +354,6 @@ wss.on('connection', (ws) => {
   });
 });
 
-console.log(`[ws] listening on :${PORT}`);
+console.log(`[ws] listening on :${PORT} — point Flutter app at ws://<lan-ip>:${PORT}`);
+console.log(`[boot] ready (DashScope ${DASHSCOPE_MODEL}, langs ${DASHSCOPE_LANGUAGES.join('+')})`);
+
