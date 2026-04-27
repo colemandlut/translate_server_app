@@ -91,7 +91,13 @@ class DashscopeStream {
     if (event === 'task-started') {
       console.log('[dashscope] task-started');
       this.ready = true;
-      // Audio flushing happens in Task 4
+      if (this._pcmBuffer.length > 0) {
+        for (const buf of this._pcmBuffer) {
+          try { this.ws.send(buf, { binary: true }); } catch (_) {}
+        }
+        console.log(`[dashscope] flushed ${this._pcmBuffer.length} buffered chunks on ready`);
+        this._pcmBuffer = [];
+      }
     } else if (event === 'result-generated') {
       // Result handling arrives in Task 5
     } else if (event === 'task-finished') {
@@ -104,7 +110,20 @@ class DashscopeStream {
   }
 
   sendAudio(pcmChunk) {
-    // Implemented in Task 4
+    if (this.closed) return;
+    if (!this.ready) {
+      this._pcmBuffer.push(pcmChunk);
+      return;
+    }
+    if (this._pcmBuffer.length > 0) {
+      // Flush buffer in order, then drop the buffer
+      for (const buf of this._pcmBuffer) {
+        try { this.ws.send(buf, { binary: true }); } catch (_) {}
+      }
+      console.log(`[dashscope] flushed ${this._pcmBuffer.length} buffered chunks`);
+      this._pcmBuffer = [];
+    }
+    try { this.ws.send(pcmChunk, { binary: true }); } catch (_) {}
   }
 
   finish() {
@@ -163,7 +182,7 @@ class Session {
     if (this._frameCount === 1) {
       console.log(`[audio] first frame decoded: ${pcm.length} bytes pcm`);
     }
-    // PCM bridging to DashScope arrives in Task 4
+    if (this.dashscope) this.dashscope.sendAudio(pcm);
   }
 
   stop() {
