@@ -46,7 +46,7 @@ class Session {
   }
 
   audio(opusFrame) {
-    if (!this.active) return;
+    if (!this.active || !this.opus) return;
     let pcm;
     try {
       const decoded = this.opus.decode(opusFrame, 320); // 20ms @ 16kHz = 320 samples
@@ -64,6 +64,7 @@ class Session {
 
   stop() {
     this.active = false;
+    this.opus = null;
     console.log(`[session] stop (${this._frameCount} frames received)`);
   }
 
