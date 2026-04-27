@@ -261,6 +261,8 @@ class Session {
     this.langB = 'zh-CN';
     this.active = false;
     this._frameCount = 0;
+    this._firstAudioTs = 0;
+    this._firstPartialTs = 0;
     this._finalChain = Promise.resolve();
   }
 
@@ -271,6 +273,10 @@ class Session {
     this._frameCount = 0;
     this.dashscope = new DashscopeStream({
       onPartial: (text) => {
+        if (this._firstPartialTs === 0 && this._firstAudioTs > 0) {
+          this._firstPartialTs = Date.now();
+          console.log(`[latency] first-word: ${this._firstPartialTs - this._firstAudioTs}ms`);
+        }
         const detected = detectLang(text);
         const dir = detectDirection(detected, this.langA, this.langB);
         this.send({ type: 'interim', text, lang: dir.spoken });
@@ -317,6 +323,7 @@ class Session {
     }
     this._frameCount++;
     if (this._frameCount === 1) {
+      this._firstAudioTs = Date.now();
       console.log(`[audio] first frame decoded: ${pcm.length} bytes pcm`);
     }
     if (this.dashscope) this.dashscope.sendAudio(pcm);

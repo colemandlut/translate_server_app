@@ -16,14 +16,37 @@
 - DashScope 原生 partial 是否提供"逐字增量"体验
 - 服务端 VAD 完全交给 DashScope 后，整体代码与运行复杂度是否显著低于 Whisper / Moonshine 路径
 
-### 1.1 KPI
+### 1.1 KPI（目标 + 实测）
+
+**目标 KPI（设计期，2026-04-27）：**
 
 | 指标 | 目标 |
 |---|---|
 | 首词延迟（用户开口 → app 收到首个 `interim`） | P50 ≤ 500ms |
 | 流式粒度 | 逐字增量（DashScope 原生） |
 | 句末判定 | 由 DashScope `SentenceEnd` 触发 final |
-| 自动语种识别 | 中 / 英（与现有协议 `lang` 字段对齐） |
+| 自动语种识别 | 中 / 英（与现有协议 `lang` 字段对齐；v2 也支持日韩粤但暂不放进 KPI） |
+
+**实测结果（2026-04-27 Task 8 验收，10 句中文 TTS 样本，本地 Mac → 公网 DashScope cn-shanghai endpoint）：**
+
+| 指标 | 实测 | 与目标差距 |
+|---|---|---|
+| 首词延迟 P50 | **835ms** | 超出目标 67% |
+| 首词延迟 P95 | 1601ms | — |
+| 首词延迟 mean | 975ms | — |
+| 流式粒度 | 逐字增量 ✓ | 达标 |
+| 句末判定 | DashScope `SentenceEnd` ✓ | 达标 |
+| 自动语种识别 | 中/英自动正确切换 ✓ | 达标 |
+
+**根因分析：** 每个 session 在收到 app 的 `start` 后才**冷启动**对 DashScope 的 WebSocket 连接，TCP/TLS 握手 ~300–1000ms 期间音频被本地缓冲；`task-started` 到达时已积压 15–51 帧待 flush，DashScope 处理完 flush 才出第一个 partial。基线延迟由握手 + 缓冲累积 + 推理三部分组成，无论 DashScope 推理多快，**冷连模式下 P50 难以压进 500ms**。
+
+**优化方向（不在本 spec 范围内，留给后续 task）：**
+
+- **Pre-connect**：在 `ws.on('connection')` 阶段就开始与 DashScope 握手（用默认 `language_hints: ['zh','en']`），不等 app 的 `start`。等用户真正按下录音键时，DashScope 连接已就绪，首词延迟 ≈ 推理时间 ≈ 250–400ms（理论可进 KPI）。代价：每个 app 连接都会持有一个 DashScope 连接，资源/费用略升；`start` 帧的 langA/langB 与预热假设不一致时需重连。
+- **Connection pooling**：服务端维护若干预热好的 DashScope 连接池，新会话从池中取。
+- **Region 调整**：换到 cn-beijing region（用户的 workspace 已在此 region），可能进一步压缩 RTT。
+
+**结论：** 当前 serverDashscope 作为对比基准（D 路线本意）已经回答了核心问题——「DashScope SaaS + 冷连架构」首词延迟基线约 800ms。是否值得为压进 500ms 投入 pre-connect 优化，由 spec §6.3 的跨后端主观对比结果决定（待 Task 9 后用户运行）。
 
 ### 1.2 明确不做（YAGNI）
 
