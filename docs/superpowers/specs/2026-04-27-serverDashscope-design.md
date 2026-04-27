@@ -128,6 +128,8 @@ serverDashscope/
 | `PORT` | | `8082` | 选 8082 避免与 v1/v2/Whisper(8080) 及 Moonshine(8081) 冲突 |
 | `DASHSCOPE_MODEL` | | `paraformer-realtime-v2` | 可改为 `paraformer-realtime-8k-v2` 等做对比 |
 | `DASHSCOPE_LANGUAGES` | | `zh,en` | 逗号分隔，传给 `language_hints` |
+| `DASHSCOPE_WORKSPACE_ID` | | (空) | 非默认业务空间时必填，作为 `X-DashScope-WorkSpace` header 发送 |
+| `DASHSCOPE_WS_URL` | | `wss://dashscope.aliyuncs.com/api-ws/v1/inference` | 仅当公网 endpoint 拒绝你的 key（401/403）需要走 workspace-scoped MaaS 主机时覆盖 |
 
 ---
 
@@ -206,6 +208,8 @@ X-DashScope-DataInspection: enable
 
 ### 4.5 首词延迟预算
 
+> ⚠️ **以下是设计期的预算估算，未考虑冷连接握手成本。实测结果（P50 = 835ms）见 §1.1 — 该预算假设 DashScope 连接已预热（pre-connect），实际部署中每个 session 都要冷启动 WS 握手 ~300–1000ms，因此实测远高于预算。预算在「连接已预热」假设下仍然成立。**
+
 ```
 app→server LAN          ~5ms
 Opus 解码                ~1ms
@@ -250,7 +254,7 @@ DashScope 推理首字       ~200–300ms（Paraformer-Realtime 公开数据）
 ### 6.1 手工冒烟（必做）
 
 1. 终端 1：`PORT=8082 DASHSCOPE_API_KEY=... GOOGLE_API_KEY=... node server.js`
-2. 终端 2（可选）：`wscat -c ws://localhost:8082` 发 `{"type":"start","sourceLang":"auto","targetLang":"en"}`，确认能拿到 `task-started` 之后的状态
+2. 终端 2（可选）：`wscat -c ws://localhost:8082` 发 `{"type":"start","langA":"zh-CN","langB":"en-US"}`，确认能拿到 `task-started` 之后的状态（Flutter app 实际发送的是 `{langA, langB}` 双语对译协议，非 `{sourceLang, targetLang}`，详见 plan §"Spec Reconciliation"）
 3. Flutter app 把 `serverUrl` 改为 `ws://<mac-ip>:8082`，做以下用例：
    - 说一句中文：观察是否逐字增量出现，首词观感 ≤ 0.5s
    - 说一句英文：同上，且 `lang` 字段切到 `en`

@@ -23,7 +23,8 @@ console.log(`[boot] serverDashscope on :${PORT}`);
 console.log(`[boot] model=${DASHSCOPE_MODEL} languages=${DASHSCOPE_LANGUAGES.join(',')}`);
 console.log(`[boot] ws_url=${DASHSCOPE_WS_URL}${DASHSCOPE_WORKSPACE_ID ? ` workspace=${DASHSCOPE_WORKSPACE_ID}` : ''}`);
 
-// ---- Translation (copied from serverWhisper/server.js — keep in sync) ----
+// ---- Translation (initially copied from serverWhisper/server.js; timeout tightened to 3s
+//      because a slow translate would block the per-session promise chain in onFinal) ----
 const https = require('https');
 
 function translateText(text, targetLang) {
@@ -195,6 +196,7 @@ class DashscopeStream {
   _callError(err) {
     if (this._errored) return;
     this._errored = true;
+    this._pcmBuffer = []; // drop any buffered audio — session is failed
     this.onError && this.onError(err);
   }
 
