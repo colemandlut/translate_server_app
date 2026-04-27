@@ -102,7 +102,7 @@ const DASHSCOPE_MODEL = process.env.DASHSCOPE_MODEL || 'paraformer-realtime-v2';
 const DASHSCOPE_LANGUAGES = (process.env.DASHSCOPE_LANGUAGES || 'zh,en')
   .split(',').map((s) => s.trim()).filter(Boolean);
 const DASHSCOPE_WS_URL = process.env.DASHSCOPE_WS_URL
-  || 'wss://dashscope.aliyuncs.com/api-ws/v1/inference/';
+  || 'wss://dashscope.aliyuncs.com/api-ws/v1/inference';
 const DASHSCOPE_WORKSPACE_ID = process.env.DASHSCOPE_WORKSPACE_ID || '';
 
 if (!DASHSCOPE_API_KEY) {
@@ -132,10 +132,14 @@ PORT=8082                             # Avoids 8080 (v1/v2/Whisper) and 8081 (Mo
 DASHSCOPE_MODEL=paraformer-realtime-v2
 DASHSCOPE_LANGUAGES=zh,en
 
-# Workspace endpoint (REQUIRED if your key belongs to a non-default DashScope workspace —
-# e.g. a cn-beijing private MaaS deployment). Leave both unset to use public DashScope.
-DASHSCOPE_WS_URL=wss://ws-0aeifgnnem2sw62m.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference/
+# Workspace ID — set this so DashScope routes the call to the correct workspace
+# and bills it correctly. Sent as `X-DashScope-WorkSpace` header.
 DASHSCOPE_WORKSPACE_ID=ws-0aeifgnnem2sw62m
+
+# Override only if the public DashScope endpoint fails for your key (e.g. 401/403)
+# and your account requires a private workspace-scoped MaaS host. Default keeps
+# the public endpoint as recommended by the official paraformer-realtime-v2 docs.
+# DASHSCOPE_WS_URL=wss://ws-0aeifgnnem2sw62m.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference
 ```
 
 - [ ] **Step 1.5: Smoke — fail-fast on missing env**
@@ -967,7 +971,7 @@ Expected boot output (no `[latency]` lines should ever appear during a session n
 ```
 [boot] serverDashscope on :8082
 [boot] model=paraformer-realtime-v2 languages=zh,en
-[boot] ws_url=wss://ws-0aeifgnnem2sw62m.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference/ workspace=ws-0aeifgnnem2sw62m
+[boot] ws_url=wss://dashscope.aliyuncs.com/api-ws/v1/inference workspace=ws-0aeifgnnem2sw62m
 [ws] listening on :8082 — point Flutter app at ws://<lan-ip>:8082
 [boot] ready (DashScope paraformer-realtime-v2, langs zh+en)
 ```
