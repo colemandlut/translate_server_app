@@ -23,6 +23,102 @@ console.log(`[boot] serverDashscope on :${PORT}`);
 console.log(`[boot] model=${DASHSCOPE_MODEL} languages=${DASHSCOPE_LANGUAGES.join(',')}`);
 console.log(`[boot] ws_url=${DASHSCOPE_WS_URL}${DASHSCOPE_WORKSPACE_ID ? ` workspace=${DASHSCOPE_WORKSPACE_ID}` : ''}`);
 
+// ---- DashScope client ----
+const WebSocket = require('ws');
+const { randomUUID } = require('crypto');
+
+class DashscopeStream {
+  constructor({ onPartial, onFinal, onError }) {
+    this.onPartial = onPartial;
+    this.onFinal = onFinal;
+    this.onError = onError;
+    this.ws = null;
+    this.taskId = randomUUID().replace(/-/g, '');
+    this.ready = false;
+    this.closed = false;
+    this._pcmBuffer = []; // PCM chunks received before task-started
+  }
+
+  connect() {
+    const headers = {
+      'Authorization': `Bearer ${DASHSCOPE_API_KEY}`,
+      'X-DashScope-DataInspection': 'enable',
+    };
+    if (DASHSCOPE_WORKSPACE_ID) headers['X-DashScope-WorkSpace'] = DASHSCOPE_WORKSPACE_ID;
+    this.ws = new WebSocket(DASHSCOPE_WS_URL, { headers });
+    this.ws.on('open', () => {
+      console.log(`[dashscope] ws open, task_id=${this.taskId}`);
+      this._sendRunTask();
+    });
+    this.ws.on('message', (data, isBinary) => this._onMessage(data, isBinary));
+    this.ws.on('error', (e) => {
+      console.error('[dashscope] ws error:', e.message);
+      this.onError && this.onError(e);
+    });
+    this.ws.on('close', (code, reason) => {
+      this.closed = true;
+      console.log(`[dashscope] ws closed code=${code} reason=${reason}`);
+    });
+  }
+
+  _sendRunTask() {
+    const msg = {
+      header: { action: 'run-task', task_id: this.taskId, streaming: 'duplex' },
+      payload: {
+        task_group: 'audio',
+        task: 'asr',
+        function: 'recognition',
+        model: DASHSCOPE_MODEL,
+        parameters: {
+          format: 'pcm',
+          sample_rate: 16000,
+          language_hints: DASHSCOPE_LANGUAGES,
+          semantic_punctuation_enabled: true,
+          max_sentence_silence: 800,
+        },
+        input: {},
+      },
+    };
+    this.ws.send(JSON.stringify(msg));
+  }
+
+  _onMessage(data, isBinary) {
+    if (isBinary) return; // DashScope responses are JSON text frames
+    let msg;
+    try { msg = JSON.parse(data.toString()); }
+    catch (e) { console.error('[dashscope] bad json:', e.message); return; }
+    const event = msg.header && msg.header.event;
+    if (event === 'task-started') {
+      console.log('[dashscope] task-started');
+      this.ready = true;
+      // Audio flushing happens in Task 4
+    } else if (event === 'result-generated') {
+      // Result handling arrives in Task 5
+    } else if (event === 'task-finished') {
+      console.log('[dashscope] task-finished');
+    } else if (event === 'task-failed') {
+      const err = (msg.header && msg.header.error_message) || 'unknown';
+      console.error('[dashscope] task-failed:', err);
+      this.onError && this.onError(new Error(err));
+    }
+  }
+
+  sendAudio(pcmChunk) {
+    // Implemented in Task 4
+  }
+
+  finish() {
+    if (this.closed || !this.ws) return;
+    try {
+      this.ws.send(JSON.stringify({
+        header: { action: 'finish-task', task_id: this.taskId, streaming: 'duplex' },
+        payload: { input: {} },
+      }));
+    } catch (e) { console.error('[dashscope] finish error:', e.message); }
+    setTimeout(() => { try { this.ws.close(); } catch (_) {} }, 200);
+  }
+}
+
 // ---- Per-app session (DashScope wiring comes in Task 3) ----
 const { Server: WebSocketServer } = require('ws');
 const OpusScript = require('opusscript');
@@ -42,6 +138,12 @@ class Session {
     this.langB = langB || 'zh-CN';
     this.active = true;
     this._frameCount = 0;
+    this.dashscope = new DashscopeStream({
+      onPartial: (text, lang) => {/* Task 5 */},
+      onFinal: (text, lang) => {/* Task 5 */},
+      onError: (err) => { console.error('[session] dashscope error:', err.message); },
+    });
+    this.dashscope.connect();
     console.log(`[session] start langA=${this.langA} langB=${this.langB}`);
   }
 
@@ -65,6 +167,7 @@ class Session {
   stop() {
     this.active = false;
     this.opus = null;
+    if (this.dashscope) { this.dashscope.finish(); this.dashscope = null; }
     console.log(`[session] stop (${this._frameCount} frames received)`);
   }
 
