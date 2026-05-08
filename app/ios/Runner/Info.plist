@@ -49,6 +49,15 @@
 	</dict>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>This app needs microphone access for speech recognition.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>This app uses on-device speech recognition for fast offline transcription.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>This app connects to a local translation server on your Wi-Fi.</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<key>UILaunchStoryboardName</key>

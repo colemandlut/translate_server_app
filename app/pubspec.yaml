@@ -40,6 +40,18 @@ dependencies:
   opus_dart: ^3.0.1
   opus_flutter: ^3.0.3
   wakelock_plus: ^1.5.1
+  speech_to_text: ^7.0.0
+  http: ^1.2.2
+  sherpa_onnx: ^1.10.0
+  path_provider: ^2.1.4
+  audioplayers: ^6.1.0
+
+# Local fork of speech_to_text 7.3.0 with a software input-gain stage in the
+# iOS audio tap, so SFSpeechRecognizer's internal VAD doesn't swallow quiet
+# speech. See packages/speech_to_text/darwin/.../SpeechToTextPlugin.swift.
+dependency_overrides:
+  speech_to_text:
+    path: packages/speech_to_text
 
 dev_dependencies:
   flutter_test:
@@ -62,6 +74,12 @@ flutter:
   # included with your application, so that you can use the icons in
   # the material Icons class.
   uses-material-design: true
+
+  assets:
+    - assets/models/multi-stream/encoder-epoch-75-avg-11-chunk-16-left-128.int8.onnx
+    - assets/models/multi-stream/decoder-epoch-75-avg-11-chunk-16-left-128.onnx
+    - assets/models/multi-stream/joiner-epoch-75-avg-11-chunk-16-left-128.int8.onnx
+    - assets/models/multi-stream/tokens.txt
 
   # To add assets to your application, add an assets section, like this:
   # assets:

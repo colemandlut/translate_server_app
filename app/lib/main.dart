@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'home_page.dart';
+import 'root_scaffold.dart';
 
 void main() {
   runApp(const TranslateApp());
@@ -17,7 +17,7 @@ class TranslateApp extends StatelessWidget {
         brightness: Brightness.dark,
         scaffoldBackgroundColor: const Color(0xFF1a1a2e),
       ),
-      home: const HomePage(),
+      home: const RootScaffold(),
     );
   }
 }

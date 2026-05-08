@@ -89,6 +89,7 @@ class DashscopeStream {
     this._connectTimer = null;
     this._finishTimer = null;
     this._errored = false;
+    this._finishPending = false; // finish() called before task-started
   }
 
   connect() {
@@ -166,6 +167,13 @@ class DashscopeStream {
         console.log(`[dashscope] flushed ${this._pcmBuffer.length} buffered chunks on ready`);
         this._pcmBuffer = [];
       }
+      // If finish() was requested before we were ready (e.g. client sent
+      // start + all audio + stop in one burst), send finish-task now.
+      if (this._finishPending) {
+        console.log('[dashscope] deferred finish-task fired after task-started');
+        this._finishPending = false;
+        this.finish();
+      }
     } else if (event === 'result-generated') {
       const sentence = msg.payload && msg.payload.output && msg.payload.output.sentence;
       if (!sentence) return;
@@ -224,15 +232,23 @@ class DashscopeStream {
 
   finish() {
     if (this.closed || !this.ws) return;
-    if (this.ws.readyState === WebSocket.OPEN) {
-      try {
-        this.ws.send(JSON.stringify({
-          header: { action: 'finish-task', task_id: this.taskId, streaming: 'duplex' },
-          payload: { input: {} },
-        }));
-      } catch (e) { console.error('[dashscope] finish error:', e.message); }
+    // If task-started hasn't arrived yet, defer the finish; _onMessage will
+    // call finish() again as soon as task-started comes back.
+    if (!this.ready || this.ws.readyState !== WebSocket.OPEN) {
+      this._finishPending = true;
+      console.log('[dashscope] finish() deferred — task not yet started');
+      return;
     }
-    this._finishTimer = setTimeout(() => { try { this.ws.close(); } catch (_) {} }, 1500);
+    try {
+      this.ws.send(JSON.stringify({
+        header: { action: 'finish-task', task_id: this.taskId, streaming: 'duplex' },
+        payload: { input: {} },
+      }));
+    } catch (e) { console.error('[dashscope] finish error:', e.message); }
+    // 10s — long enough for DashScope to finish processing burst-uploaded
+    // audio (e.g. an 8-second utterance from cloud secondary recognition);
+    // task-finished arriving sooner clears this timer (line ~193).
+    this._finishTimer = setTimeout(() => { try { this.ws.close(); } catch (_) {} }, 10_000);
     this._finishTimer.unref();
   }
 }
@@ -264,6 +280,8 @@ class Session {
     this.active = false;
     this._frameCount = 0;
     this._finalChain = Promise.resolve();
+    this._lastInterimText = '';
+    this._lastInterimTranslateAt = 0;
   }
 
   start(langA, langB) {
@@ -273,9 +291,20 @@ class Session {
     this._frameCount = 0;
     this.dashscope = new DashscopeStream({
       onPartial: (text) => {
+        if (text === this._lastInterimText) return; // dashscope repeats identical partials
+        this._lastInterimText = text;
         const detected = detectLang(text);
         const dir = detectDirection(detected, this.langA, this.langB);
         this.send({ type: 'interim', text, lang: dir.spoken });
+        // Translate partial in background, throttled. Drop result if stale.
+        const now = Date.now();
+        if (now - this._lastInterimTranslateAt < 250) return;
+        this._lastInterimTranslateAt = now;
+        const targetCode = transCode(dir.target);
+        translateText(text, targetCode).then((translated) => {
+          if (this._lastInterimText !== text || !this.active) return;
+          this.send({ type: 'interim_translation', text, translated, lang: dir.spoken });
+        }).catch((e) => console.error('[interim translate] failed:', e.message));
       },
       onFinal: (text) => {
         // Serialize on a per-session promise chain so concurrent finals from DashScope's
@@ -336,8 +365,47 @@ class Session {
   }
 }
 
-// ---- WebSocket server ----
-const wss = new WebSocketServer({ port: PORT });
+// ---- HTTP server (translate proxy for on-device clients) + WS upgrade ----
+const http = require('http');
+const httpServer = http.createServer((req, res) => {
+  // CORS for browser clients (no-op for native flutter HTTP)
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
+  if (req.method === 'POST' && req.url === '/translate') {
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 10000) req.destroy(); });
+    req.on('end', async () => {
+      try {
+        const { text, target } = JSON.parse(body || '{}');
+        if (!text || !target) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'text and target required' }));
+          return;
+        }
+        const translated = await translateText(text, target);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ translated }));
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // Health probe
+  if (req.method === 'GET' && (req.url === '/' || req.url === '/health')) {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('ok');
+    return;
+  }
+
+  res.writeHead(404); res.end();
+});
+
+const wss = new WebSocketServer({ server: httpServer });
 wss.on('connection', (ws) => {
   console.log('[ws] app connected');
   let session = null;
@@ -364,6 +432,9 @@ wss.on('connection', (ws) => {
   });
 });
 
-console.log(`[ws] listening on :${PORT} — point Flutter app at ws://<lan-ip>:${PORT}`);
-console.log(`[boot] ready (DashScope ${DASHSCOPE_MODEL}, langs ${DASHSCOPE_LANGUAGES.join('+')})`);
+httpServer.listen(PORT, () => {
+  console.log(`[ws] listening on :${PORT} — point Flutter app at ws://<lan-ip>:${PORT}`);
+  console.log(`[http] POST /translate available for on-device clients`);
+  console.log(`[boot] ready (DashScope ${DASHSCOPE_MODEL}, langs ${DASHSCOPE_LANGUAGES.join('+')})`);
+});
 
