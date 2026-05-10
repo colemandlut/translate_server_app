@@ -1,11 +1,10 @@
-app = "translate-relay"
+app = "translate-relay-dashscope"
 primary_region = "nrt"
 
 [build]
 
 [env]
   PORT = "8080"
-  GOOGLE_APPLICATION_CREDENTIALS = "/app/service-account.json"
 
 [http_service]
   internal_port = 8080

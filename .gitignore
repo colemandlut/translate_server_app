@@ -2,3 +2,6 @@ service-account.json
 node_modules
 debug_audio.wav
 .DS_Store
+app/assets/models/
+.env
+.claude/

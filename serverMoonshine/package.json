@@ -1,14 +1,14 @@
 {
-  "name": "translate-relay",
+  "name": "translate-relay-moonshine",
   "version": "1.0.0",
-  "description": "WebSocket relay: Opus audio -> Google STT (gRPC) -> Google Translate",
+  "description": "WebSocket relay: Opus -> Moonshine (STT, English-only) -> Google Translate",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js"
   },
   "dependencies": {
-    "@google-cloud/speech": "^6.7.0",
+    "@echogarden/fvad-wasm": "^0.2.0",
     "opusscript": "^0.1.1",
     "ws": "^8.18.0"
   }

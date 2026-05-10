@@ -1,6 +1,5 @@
 const { Server: WebSocketServer } = require('ws');
-const grpc = require('@grpc/grpc-js');
-const protoLoader = require('@grpc/proto-loader');
+const speech = require('@google-cloud/speech');
 const https = require('https');
 const path = require('path');
 const fs = require('fs');
@@ -19,18 +18,14 @@ process.on('uncaughtException', (err) => console.error('UNCAUGHT:', err.message)
 process.on('unhandledRejection', (err) => console.error('UNHANDLED:', err));
 
 // ---- Google STT V1 ----
-const PROTO_PATH = path.join(__dirname, 'google/cloud/speech/v1/cloud_speech.proto');
+// Auth: Application Default Credentials. Set GOOGLE_APPLICATION_CREDENTIALS env
+// to a service-account JSON path (api keys are no longer accepted by streaming STT).
 let speechClient = null;
 
 function getSpeechClient() {
   if (speechClient) return speechClient;
-  const pkg = protoLoader.loadSync(PROTO_PATH, {
-    keepCase: false, longs: String, enums: String, defaults: true, oneofs: true,
-  });
-  const proto = grpc.loadPackageDefinition(pkg).google.cloud.speech.v1;
-  const endpoint = process.env.STT_ENDPOINT || 'speech.googleapis.com:443';
-  speechClient = new proto.Speech(endpoint, grpc.credentials.createSsl());
-  console.log('STT endpoint:', endpoint);
+  speechClient = new speech.SpeechClient();
+  console.log('STT client initialized (ADC)');
   return speechClient;
 }
 
@@ -136,17 +131,11 @@ class Session {
     this._lastInterimText = '';
     this._streamStartTime = Date.now(); // cooldown for ghost interims
 
-    const meta = new grpc.Metadata();
-    meta.add('x-goog-api-key', API_KEY);
-
+    // SDK style: pass config as the streamingRecognize argument; subsequent writes
+    // are raw audio bytes. (Hand-written oneof messages get rejected as malformed.)
     let s;
-    try { s = getSpeechClient().streamingRecognize(meta); }
-    catch (e) { this.log('gRPC fail: ' + e.message); return; }
-    this.stream = s;
-
-    // OGG_OPUS encoding: send OGG headers first, then wrap each Opus frame
-    s.write({
-      streamingConfig: {
+    try {
+      s = getSpeechClient().streamingRecognize({
         config: {
           encoding: 'OGG_OPUS',
           sampleRateHertz: 16000,
@@ -156,19 +145,20 @@ class Session {
         },
         interimResults: true,
         singleUtterance: false,
-      },
-    });
+      });
+    } catch (e) { this.log('gRPC fail: ' + e.message); return; }
+    this.stream = s;
 
-    // Create OGG writer and send headers
+    // Create OGG writer and send headers as the first audio chunk
     this.oggWriter = new OggOpusWriter(16000, 1);
     const headers = this.oggWriter.getHeaders();
     this._oggHeader = headers; // save for audio debug
-    try { s.write({ audioContent: headers }); } catch (_) {}
+    try { s.write(headers); } catch (_) {}
 
     // Flush queued audio
     while (this.audioQueue.length > 0) {
       const buf = this.audioQueue.shift();
-      try { s.write({ audioContent: buf }); } catch (_) { break; }
+      try { s.write(buf); } catch (_) { break; }
     }
 
     s.on('data', (resp) => {
@@ -409,7 +399,7 @@ class Session {
     if (SAVE_AUDIO) this._audioChunks.push(Buffer.from(oggPage));
 
     if (this.stream) {
-      try { this.stream.write({ audioContent: oggPage }); }
+      try { this.stream.write(oggPage); }
       catch (_) { this.audioQueue.push(oggPage); }
     } else {
       this.audioQueue.push(oggPage);
@@ -419,6 +409,21 @@ class Session {
   }
 
   stop() {
+    // Promote any in-flight interim to a synthesized final so the client gets
+    // closure for the current utterance (Google STT often hasn't emitted its
+    // own final by the time the user releases the mic).
+    if (this.active && this._lastInterimText && !this._earlyFinalSent) {
+      const text = this._lastInterimText;
+      const detectedLang = this._lastInterimLang || '';
+      const dir = detectDirection(text, this.langA, this.langB);
+      const translated = this.lastInterimTranslated || '...';
+      this._send({
+        type: 'final', text, translated,
+        spokenLang: langName(dir.spoken),
+        translatedLang: langName(dir.target),
+        detectedLang,
+      });
+    }
     this.active = false;
     this.streamVer++;
     if (this.silenceTimer) clearTimeout(this.silenceTimer);

@@ -71,7 +71,7 @@ class _HomePageState extends State<HomePage>
   String _liveText = '';
   String _liveTranslation = '';
   String _status = 'Connecting...';
-  int _selectedServer = 0; // 0 = Dashscope (default)
+  int _selectedServer = 3; // 3 = On-Device (Apple Speech) — default
   String get _serverUrl => _servers[_selectedServer].url;
 
   final _recorder = AudioRecorder();
@@ -87,6 +87,10 @@ class _HomePageState extends State<HomePage>
   int? _sessionStartTranscriptCount;
   String? _sessionId;
   final _audioWriter = AudioFileWriter();
+  // Apple mode writes its m4a inside the patched plugin (audio tap → AAC),
+  // bypassing the Runner-side AudioFileWriter to avoid the cross-thread
+  // dispatch that caused crashes when streaming PCM via method channel.
+  String? _appleRecordingPath;
 
   // On-device speech (Apple Speech via SFSpeechRecognizer)
   final stt.SpeechToText _speech = stt.SpeechToText();
@@ -103,6 +107,12 @@ class _HomePageState extends State<HomePage>
   // until the final handler picks it up and runs cloud secondary on it.
   static const _appleAudioChannel =
       MethodChannel('plugin.csdcorp.com/speech_to_text/audio_buffer');
+  // Direct line into the patched speech_to_text plugin for the two custom
+  // methods that aren't exposed by the SpeechToText Dart wrapper:
+  //   setKeepAudioEngineAlive — silence stops only finish the SFSpeech task,
+  //   fullStop — actually tear the audio engine down (called on user Stop).
+  static const _appleSttChannel =
+      MethodChannel('plugin.csdcorp.com/speech_to_text');
   bool _appleAudioHandlerInstalled = false;
   Uint8List? _pendingApplePcm;
 
@@ -184,6 +194,12 @@ class _HomePageState extends State<HomePage>
           }
         },
       );
+      // Tell the patched plugin to keep its AVAudioEngine + tap running across
+      // silence-induced stop()s so the recording archive gets a continuous
+      // file. Paired with the fullStop call in _stopListening's Apple branch.
+      try {
+        await _appleSttChannel.invokeMethod('setKeepAudioEngineAlive', true);
+      } catch (_) {}
     } catch (e) {
       debugPrint('stt init: $e');
     }
@@ -381,6 +397,10 @@ class _HomePageState extends State<HomePage>
       _onDeviceSilenceTimer?.cancel();
       _onDeviceSilenceTimer = null;
       try { await _speech.stop(); } catch (_) {}
+      // closeRecordingFile finalizes the m4a (writes moov atom). fullStop
+      // then tears down the AVAudioEngine so the mic releases.
+      try { await _appleSttChannel.invokeMethod('closeRecordingFile'); } catch (_) {}
+      try { await _appleSttChannel.invokeMethod('fullStop'); } catch (_) {}
       _pendingApplePcm = null;
     } else if (_isSherpa) {
       await _stopSherpaListening();
@@ -421,6 +441,20 @@ class _HomePageState extends State<HomePage>
     _saveSessionIfAny();
   }
 
+  Future<String?> _openAppleRecordingFile(String sessionId) async {
+    try {
+      final dir = await getApplicationDocumentsDirectory();
+      final outDir = Directory('${dir.path}/recordings');
+      if (!await outDir.exists()) await outDir.create(recursive: true);
+      final path = '${outDir.path}/$sessionId.m4a';
+      await _appleSttChannel.invokeMethod('openRecordingFile', {'path': path});
+      return path;
+    } catch (e) {
+      debugPrint('apple openRecordingFile: $e');
+      return null;
+    }
+  }
+
   Future<void> _saveSessionIfAny() async {
     final startedAt = _sessionStartedAt;
     final startCount = _sessionStartTranscriptCount;
@@ -428,9 +462,24 @@ class _HomePageState extends State<HomePage>
     _sessionStartedAt = null;
     _sessionStartTranscriptCount = null;
     _sessionId = null;
-    // Always stop the writer (idempotent) so the m4a file finalizes even if
-    // we're going to skip persisting the session.
-    final audioPath = await _audioWriter.stop();
+    // Always stop the (Runner-side) writer used by ws/sherpa. Apple wrote
+    // its file inside the plugin, _appleRecordingPath holds the path.
+    final writerPath = await _audioWriter.stop();
+    String? audioPath;
+    if (_appleRecordingPath != null) {
+      final p = _appleRecordingPath!;
+      _appleRecordingPath = null;
+      try {
+        final f = File(p);
+        if (await f.exists() && await f.length() > 1024) {
+          audioPath = p;
+        } else if (await f.exists()) {
+          await f.delete();
+        }
+      } catch (_) {}
+    } else {
+      audioPath = writerPath;
+    }
     if (startedAt == null || startCount == null || sessionId == null) return;
     final entries = startCount < _transcripts.length
         ? _transcripts.sublist(startCount).map((e) => TranscriptEntry(
@@ -441,11 +490,12 @@ class _HomePageState extends State<HomePage>
               translatedLang: e.translatedLang,
             )).toList()
         : <TranscriptEntry>[];
-    if (entries.isEmpty && audioPath == null) return;
+    final finalAudioPath = audioPath;
+    if (entries.isEmpty && finalAudioPath == null) return;
     final session = RecordingSession(
       id: sessionId,
       createdAt: startedAt,
-      audioPath: audioPath,
+      audioPath: finalAudioPath,
       liveTranscripts: entries,
       langA: _langA.code,
       langB: _langB.code,
@@ -477,14 +527,7 @@ class _HomePageState extends State<HomePage>
     if (!_appleAudioHandlerInstalled) {
       _appleAudioChannel.setMethodCallHandler((call) async {
         if (call.method == 'buffer' && call.arguments is Uint8List) {
-          final blob = call.arguments as Uint8List;
-          debugPrint('apple pcm channel buffer: ${blob.length} bytes');
-          _pendingApplePcm = blob;
-          // Mirror to the on-disk recording. The plugin only flushes per
-          // utterance so the resulting m4a is per-utterance segments back to
-          // back (silence between SFSpeech endpoints is dropped) — acceptable
-          // for playback, and the only stream Apple gives us.
-          _audioWriter.write(blob);
+          _pendingApplePcm = call.arguments as Uint8List;
         }
       });
       _appleAudioHandlerInstalled = true;
@@ -499,7 +542,10 @@ class _HomePageState extends State<HomePage>
 
     _sessionStartedAt = DateTime.now();
     _sessionId = 'sess_${_sessionStartedAt!.millisecondsSinceEpoch}';
-    await _audioWriter.start(sessionId: _sessionId!);
+    // Tell the patched plugin to start writing m4a directly from its audio
+    // tap. We bypass _audioWriter (Runner side) for Apple mode because
+    // method-channel-streamed PCM crashed under load.
+    _appleRecordingPath = await _openAppleRecordingFile(_sessionId!);
     _sessionStartTranscriptCount = _transcripts.length;
     setState(() {
       _isListening = true;

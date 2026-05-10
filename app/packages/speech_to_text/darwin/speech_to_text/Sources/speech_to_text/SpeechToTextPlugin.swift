@@ -116,6 +116,30 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
   private var audioMethodChannel: FlutterMethodChannel?
   private var pcmAccumulator = Data()
   private let pcmAccumulatorLock = NSLock()
+  // Plugin-owned m4a/AAC writer for the Apple recording archive. Going
+  // through Dart via method channel (per-buffer or batched) crashed; writing
+  // directly from the audio tap avoids any cross-thread dispatch overhead.
+  // The file is opened lazily on the first buffer so we can match the input
+  // format exactly — that way AAC encoder doesn't have to resample, which
+  // was the source of remaining buffer-boundary clicks.
+  private var recordingFile: AVAudioFile?
+  private var recordingFilePendingPath: String?
+  private let recordingFileLock = NSLock()
+  // Cached AVAudioConverter for the 48kHz→16kHz downsample. Building a fresh
+  // one per audio tap buffer (we used to) gives the resampling filter no
+  // cross-buffer context, so 3:1 decimation produces a phase discontinuity
+  // at every buffer boundary — audible as crackle. Cached converters keep
+  // their internal state across calls. Reset whenever a fresh AVAudioEngine
+  // is initialized (input format may change).
+  private var cachedDownsampleConverter: AVAudioConverter?
+  private var cachedDownsampleInputFormat: AVAudioFormat?
+  // When true, `stop` only finalizes the current SFSpeech task and leaves the
+  // AVAudioEngine + tap running so the next `listen` can re-attach to a still-
+  // open audio stream. Used by clients (Apple-mode recording) that want a
+  // continuous file across silence-induced auto-restart cycles. The Dart side
+  // must call `fullStop` when the user actually stops, to tear the engine
+  // down and release the audio session.
+  private var keepAudioEngineAlive = false
   private static let audioBufferTargetFormat: AVAudioFormat = AVAudioFormat(
     commonFormat: .pcmFormatInt16, sampleRate: 16000.0, channels: 1, interleaved: true
   )!
@@ -229,6 +253,26 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
         } else {
             locales(result)
         }
+    case "setKeepAudioEngineAlive":
+        if let v = call.arguments as? Bool {
+            self.keepAudioEngineAlive = v
+            NSLog("[stt-fork] keepAudioEngineAlive=%@", v ? "true" : "false")
+        }
+        result(true)
+    case "fullStop":
+        // Tear the audio engine + tap down. Used by clients that asked for
+        // keepAudioEngineAlive — without this, the engine would stay running
+        // forever after the user stops listening.
+        fullStop(result)
+    case "openRecordingFile":
+        guard let path = (call.arguments as? [String: Any])?["path"] as? String else {
+          result(FlutterError(code: "bad_args", message: "path required", details: nil))
+          return
+        }
+        openRecordingFile(at: path, result: result)
+    case "closeRecordingFile":
+        closeRecordingFile()
+        result(true)
     default:
       os_log("Unrecognized method: %{PUBLIC}@", log: pluginLog, type: .error, call.method)
       DispatchQueue.main.async {
@@ -399,6 +443,21 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
     stopping = true
     stopAllPlayers()
     self.currentTask?.finish()
+    if keepAudioEngineAlive {
+      // Leave audio engine + tap running; next listen() will reattach. Drop
+      // listening/currentTask state so listenForSpeech's reentry guard
+      // passes. KEEP stopping=true: didFinishSuccessfully fires async after
+      // task.finish() and would otherwise call stopCurrentListen() (tearing
+      // the engine down) when it sees stopping=false. listenForSpeech's
+      // entry resets stopping=false naturally when reusing the engine.
+      self.currentTask = nil
+      self.listening = false
+      invokeFlutter(
+        SwiftSpeechToTextCallbackMethods.notifyStatus,
+        arguments: SpeechToTextStatus.done.rawValue)
+      sendBoolResult(true, result)
+      return
+    }
     if let sound = successSound {
       onPlayEnd = { () -> Void in
         self.stopCurrentListen()
@@ -410,6 +469,15 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
       stopCurrentListen()
       sendBoolResult(true, result)
     }
+  }
+
+  private func fullStop(_ result: @escaping FlutterResult) {
+    stopping = true
+    stopAllPlayers()
+    self.currentTask?.finish()
+    closeRecordingFile()
+    stopCurrentListen()
+    sendBoolResult(true, result)
   }
 
   private func cancelSpeech(_ result: @escaping FlutterResult) {
@@ -499,6 +567,13 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
       sendBoolResult(false, result)
       return
     }
+    // Reuse the audio engine + tap if a previous listen() finished its task
+    // but kept the engine alive (keepAudioEngineAlive mode). Keeps the audio
+    // stream continuous across silence-induced auto-restart cycles, which is
+    // what the in-app recording archive needs.
+    let reuseAudioEngine = keepAudioEngineAlive
+      && (self.audioEngine?.isRunning ?? false)
+      && self.inputNode != nil
     do {
       //    let inErrorTest = true
       failedListen = false
@@ -524,44 +599,58 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
         }
       }
 
-      #if os(iOS)
-        rememberedAudioCategory = self.audioSession.category
-        rememberedAudioCategoryOptions = self.audioSession.categoryOptions
-        try self.audioSession.setCategory(
-          AVAudioSession.Category.playAndRecord,
-          options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP, .mixWithOthers])
-        //            try self.audioSession.setMode(AVAudioSession.Mode.measurement)
-        if sampleRate > 0 {
-          try self.audioSession.setPreferredSampleRate(Double(sampleRate))
-        }
-        try self.audioSession.setMode(AVAudioSession.Mode.default)
-        try self.audioSession.setActive(true, options: .notifyOthersOnDeactivation)
-        if #available(iOS 13.0, *) {
-          try self.audioSession.setAllowHapticsAndSystemSoundsDuringRecording(enableHaptics)
-        }
-      #endif
-      if let sound = listeningSound {
-        self.onPlayEnd = { () -> Void in
-          if !self.failedListen {
-            self.listening = true
-            self.invokeFlutter(
-              SwiftSpeechToTextCallbackMethods.notifyStatus,
-              arguments: SpeechToTextStatus.listening.rawValue)
-
+      if !reuseAudioEngine {
+        #if os(iOS)
+          rememberedAudioCategory = self.audioSession.category
+          rememberedAudioCategoryOptions = self.audioSession.categoryOptions
+          try self.audioSession.setCategory(
+            AVAudioSession.Category.playAndRecord,
+            options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP, .mixWithOthers])
+          //            try self.audioSession.setMode(AVAudioSession.Mode.measurement)
+          if sampleRate > 0 {
+            try self.audioSession.setPreferredSampleRate(Double(sampleRate))
           }
+          try self.audioSession.setMode(AVAudioSession.Mode.default)
+          try self.audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+          if #available(iOS 13.0, *) {
+            try self.audioSession.setAllowHapticsAndSystemSoundsDuringRecording(enableHaptics)
+          }
+        #endif
+        if let sound = listeningSound {
+          self.onPlayEnd = { () -> Void in
+            if !self.failedListen {
+              self.listening = true
+              self.invokeFlutter(
+                SwiftSpeechToTextCallbackMethods.notifyStatus,
+                arguments: SpeechToTextStatus.listening.rawValue)
+
+            }
+          }
+          sound.play()
         }
-        sound.play()
+        if !initAudioEngine(result) {
+          return
+        }
+        if inputNode?.inputFormat(forBus: 0).channelCount == 0 {
+          throw SpeechToTextError.runtimeError("Not enough available inputs.")
+        }
+        pcmAccumulatorLock.lock()
+        pcmAccumulator.removeAll(keepingCapacity: true)
+        pcmAccumulatorLock.unlock()
+        // Drop the cached resampling converter — input format may differ
+        // from the previous engine and stale state would corrupt the first
+        // few buffers.
+        cachedDownsampleConverter = nil
+        cachedDownsampleInputFormat = nil
+        NSLog("[stt-fork] listen: cleared accumulator, starting fresh tap")
+      } else {
+        NSLog("[stt-fork] listen: reusing live audio engine + tap")
+        // Engine + tap already running. Only the per-utterance accumulator
+        // resets so secondary recognize sees just this utterance's audio.
+        pcmAccumulatorLock.lock()
+        pcmAccumulator.removeAll(keepingCapacity: true)
+        pcmAccumulatorLock.unlock()
       }
-      if !initAudioEngine(result) {
-        return
-      }
-      if inputNode?.inputFormat(forBus: 0).channelCount == 0 {
-        throw SpeechToTextError.runtimeError("Not enough available inputs.")
-      }
-      pcmAccumulatorLock.lock()
-      pcmAccumulator.removeAll(keepingCapacity: true)
-      pcmAccumulatorLock.unlock()
-      NSLog("[stt-fork] listen: cleared accumulator, starting fresh tap")
       self.currentRequest = SFSpeechAudioBufferRecognitionRequest()
       guard let currentRequest = self.currentRequest else {
         sendBoolResult(false, result)
@@ -588,36 +677,44 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
         currentRequest.addsPunctuation = autoPunctuation
       }
       self.currentTask = self.recognizer?.recognitionTask(with: currentRequest, delegate: self)
-      let recordingFormat = inputNode?.outputFormat(forBus: self.busForNodeTap)
-      var fmt: AVAudioFormat!
-      #if os(iOS)
+      if !reuseAudioEngine {
+        let recordingFormat = inputNode?.outputFormat(forBus: self.busForNodeTap)
+        var fmt: AVAudioFormat!
+        #if os(iOS)
 
-        let theSampleRate = audioSession.sampleRate
+          let theSampleRate = audioSession.sampleRate
 
-        fmt = AVAudioFormat(
-          commonFormat: recordingFormat!.commonFormat, sampleRate: theSampleRate,
-          channels: recordingFormat!.channelCount, interleaved: recordingFormat!.isInterleaved)
+          fmt = AVAudioFormat(
+            commonFormat: recordingFormat!.commonFormat, sampleRate: theSampleRate,
+            channels: recordingFormat!.channelCount, interleaved: recordingFormat!.isInterleaved)
 
-      #else
-        let bus = 0
-        fmt = self.inputNode?.inputFormat(forBus: bus)
+        #else
+          let bus = 0
+          fmt = self.inputNode?.inputFormat(forBus: bus)
 
-      #endif
-      try catchExceptionAsError {
-        self.inputNode?.installTap(
-          onBus: self.busForNodeTap, bufferSize: self.speechBufferSize, format: fmt
-        ) { (buffer: AVAudioPCMBuffer, when: AVAudioTime) in
-          SpeechToTextPlugin.applyInputGain(buffer: buffer, gain: SpeechToTextPlugin.inputGain)
-          currentRequest.append(buffer)
-          self.updateSoundLevel(buffer: buffer)
-          self.broadcastResampledPCM(buffer: buffer)
+        #endif
+        try catchExceptionAsError {
+          self.inputNode?.installTap(
+            onBus: self.busForNodeTap, bufferSize: self.speechBufferSize, format: fmt
+          ) { [weak self] (buffer: AVAudioPCMBuffer, when: AVAudioTime) in
+            // Read currentRequest dynamically (not via closure capture) so the
+            // tap stays valid across keepAudioEngineAlive listen cycles. Each
+            // listen() swaps in a new SFSpeechAudioBufferRecognitionRequest;
+            // the tap just appends to whichever one is current.
+            guard let self = self else { return }
+            SpeechToTextPlugin.applyInputGain(buffer: buffer, gain: SpeechToTextPlugin.inputGain)
+            self.currentRequest?.append(buffer)
+            self.updateSoundLevel(buffer: buffer)
+            self.broadcastResampledPCM(buffer: buffer)
+            self.writeRecordingBuffer(buffer)
+          }
         }
+        //    if ( inErrorTest ){
+        //        throw SpeechToTextError.runtimeError("for testing only")
+        //    }
+        self.audioEngine?.prepare()
+        try self.audioEngine?.start()
       }
-      //    if ( inErrorTest ){
-      //        throw SpeechToTextError.runtimeError("for testing only")
-      //    }
-      self.audioEngine?.prepare()
-      try self.audioEngine?.start()
       if nil == listeningSound {
         listening = true
         self.invokeFlutter(
@@ -672,13 +769,18 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
 
   private func broadcastResampledPCM(buffer: AVAudioPCMBuffer) {
     let inFmt = buffer.format
-    // Build a fresh converter per buffer. Caching it across audio-engine
-    // restarts (each _speech.listen() creates a new AVAudioEngine) caused
-    // crashes when the cached instance still pointed at the old chain. The
-    // construction cost is negligible vs the ~64ms buffer cadence.
-    guard let converter = AVAudioConverter(
-      from: inFmt, to: SpeechToTextPlugin.audioBufferTargetFormat)
-    else { return }
+    // Reuse a cached converter so the resampling filter keeps its history
+    // across buffers — building a fresh one per call introduced audible
+    // boundary clicks (3:1 decimation needs streaming context). Reset is
+    // handled by listenForSpeech when a new AVAudioEngine spins up.
+    if cachedDownsampleConverter == nil
+      || cachedDownsampleInputFormat?.sampleRate != inFmt.sampleRate
+      || cachedDownsampleInputFormat?.channelCount != inFmt.channelCount {
+      cachedDownsampleConverter = AVAudioConverter(
+        from: inFmt, to: SpeechToTextPlugin.audioBufferTargetFormat)
+      cachedDownsampleInputFormat = inFmt
+    }
+    guard let converter = cachedDownsampleConverter else { return }
 
     let outCapacity =
       AVAudioFrameCount(Double(buffer.frameLength) * 16000.0 / inFmt.sampleRate) + 64
@@ -716,6 +818,71 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
     pcmAccumulatorLock.lock()
     pcmAccumulator.append(chunk)
     pcmAccumulatorLock.unlock()
+    // Recording file is fed from the audio tap closure with the raw native
+    // buffer (no resampling), so we don't write outBuffer here.
+  }
+
+  /// Write the audio tap buffer (in its native input format) to the recording
+  /// file, lazily opening the file on the first buffer to lock its sample
+  /// rate / channel count to whatever the audio engine is producing. This
+  /// avoids any AAC-side resampling, which is what was causing residual
+  /// clicks at audio buffer boundaries.
+  private func writeRecordingBuffer(_ buffer: AVAudioPCMBuffer) {
+    recordingFileLock.lock()
+    defer { recordingFileLock.unlock() }
+    if recordingFile == nil && recordingFilePendingPath != nil {
+      openRecordingFileLockedIfNeeded(matching: buffer)
+    }
+    guard let file = recordingFile else { return }
+    do {
+      try file.write(from: buffer)
+    } catch {
+      NSLog("[stt-fork] recording write failed: %@", error.localizedDescription)
+    }
+  }
+
+  private func openRecordingFile(at path: String, result: @escaping FlutterResult) {
+    recordingFileLock.lock()
+    defer { recordingFileLock.unlock() }
+    // Defer the actual AVAudioFile open until we see the first audio tap
+    // buffer — that way we use buffer's native format (commonly 48kHz Float32
+    // mono) for both `commonFormat` and the file's `AVSampleRateKey`, so AAC
+    // encoder doesn't have to resample. Resampling at the buffer boundary
+    // produced audible clicks even with a cached AVAudioConverter.
+    recordingFilePendingPath = path
+    recordingFile = nil
+    result(true)
+  }
+
+  /// Lazily opens the recording AVAudioFile using the buffer's native format.
+  /// Caller already holds recordingFileLock.
+  private func openRecordingFileLockedIfNeeded(matching buffer: AVAudioPCMBuffer) {
+    guard let path = recordingFilePendingPath, recordingFile == nil else { return }
+    let inFmt = buffer.format
+    do {
+      let url = URL(fileURLWithPath: path)
+      let settings: [String: Any] = [
+        AVFormatIDKey: kAudioFormatMPEG4AAC,
+        AVSampleRateKey: Int(inFmt.sampleRate),
+        AVNumberOfChannelsKey: Int(inFmt.channelCount),
+        AVEncoderBitRateKey: 64000,
+      ]
+      recordingFile = try AVAudioFile(
+        forWriting: url, settings: settings,
+        commonFormat: inFmt.commonFormat, interleaved: inFmt.isInterleaved)
+      recordingFilePendingPath = nil
+    } catch {
+      NSLog("[stt-fork] lazy openRecordingFile failed: %@", error.localizedDescription)
+      recordingFilePendingPath = nil
+    }
+  }
+
+  private func closeRecordingFile() {
+    recordingFileLock.lock()
+    // Releasing AVAudioFile flushes and finalizes the m4a's moov atom.
+    recordingFile = nil
+    recordingFilePendingPath = nil
+    recordingFileLock.unlock()
   }
 
   // Called on main from handleResult, immediately before
