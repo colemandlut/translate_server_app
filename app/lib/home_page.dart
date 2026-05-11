@@ -20,6 +20,7 @@ import 'models/transcript_entry.dart';
 import 'models/recording.dart';
 import 'services/recording_store.dart';
 import 'services/audio_file_writer.dart';
+import 'services/audio_path_resolver.dart';
 import 'recordings_list_page.dart';
 
 class ServerOption {
@@ -490,7 +491,11 @@ class _HomePageState extends State<HomePage>
               translatedLang: e.translatedLang,
             )).toList()
         : <TranscriptEntry>[];
-    final finalAudioPath = audioPath;
+    // 只存相对路径（recordings/xxx.m4a），避免重装后 iOS data container UUID
+    // 变了导致绝对路径失效。播放/上传时通过 AudioPathResolver 重新拼成绝对路径。
+    final finalAudioPath = audioPath == null
+        ? null
+        : AudioPathResolver.toRelative(audioPath);
     if (entries.isEmpty && finalAudioPath == null) return;
     final session = RecordingSession(
       id: sessionId,

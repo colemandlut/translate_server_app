@@ -1,4 +1,5 @@
 import 'transcript_entry.dart';
+import 'transcript_segment.dart';
 
 class RecordingSession {
   final String id;
@@ -13,6 +14,9 @@ class RecordingSession {
   // result survives an app restart.
   final String? overallText;
   final String? overallTranslated;
+  // 整段重识别按 VAD 切出的句子级字幕。可能为 null（老会话或服务端没返回）；
+  // null 时 UI 回退到 overallText/overallTranslated 简单两栏。
+  final List<TranscriptSegment>? overallSegments;
   final String? llmSummary;
 
   RecordingSession({
@@ -26,6 +30,7 @@ class RecordingSession {
     required this.duration,
     this.overallText,
     this.overallTranslated,
+    this.overallSegments,
     this.llmSummary,
   });
 
@@ -33,6 +38,7 @@ class RecordingSession {
     String? audioPath,
     String? overallText,
     String? overallTranslated,
+    List<TranscriptSegment>? overallSegments,
     String? llmSummary,
   }) {
     return RecordingSession(
@@ -46,6 +52,7 @@ class RecordingSession {
       duration: duration,
       overallText: overallText ?? this.overallText,
       overallTranslated: overallTranslated ?? this.overallTranslated,
+      overallSegments: overallSegments ?? this.overallSegments,
       llmSummary: llmSummary ?? this.llmSummary,
     );
   }
@@ -61,6 +68,7 @@ class RecordingSession {
         'durationMs': duration.inMilliseconds,
         'overallText': overallText,
         'overallTranslated': overallTranslated,
+        'overallSegments': overallSegments?.map((e) => e.toJson()).toList(),
         'llmSummary': llmSummary,
       };
 
@@ -78,6 +86,9 @@ class RecordingSession {
       duration: Duration(milliseconds: json['durationMs'] as int),
       overallText: json['overallText'] as String?,
       overallTranslated: json['overallTranslated'] as String?,
+      overallSegments: (json['overallSegments'] as List?)
+          ?.map((e) => TranscriptSegment.fromJson(e as Map<String, dynamic>))
+          .toList(),
       llmSummary: json['llmSummary'] as String?,
     );
   }

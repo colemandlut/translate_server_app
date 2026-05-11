@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'package:http/http.dart' as http;
+import '../models/transcript_segment.dart';
 
 class FileRecognizeException implements Exception {
   final int statusCode;
@@ -13,7 +14,9 @@ class FileRecognizeResult {
   final String overallText;
   final String overallTranslated;
   final String lang;
-  FileRecognizeResult(this.overallText, this.overallTranslated, this.lang);
+  final List<TranscriptSegment> segments;
+  FileRecognizeResult(
+      this.overallText, this.overallTranslated, this.lang, this.segments);
 }
 
 class FileRecognizeClient {
@@ -36,10 +39,16 @@ class FileRecognizeClient {
       throw FileRecognizeException(resp.statusCode, resp.body);
     }
     final json = jsonDecode(resp.body) as Map<String, dynamic>;
+    final segs = (json['segments'] as List?)
+            ?.map((e) =>
+                TranscriptSegment.fromJson(e as Map<String, dynamic>))
+            .toList() ??
+        const <TranscriptSegment>[];
     return FileRecognizeResult(
       (json['overallText'] as String?) ?? '',
       (json['overallTranslated'] as String?) ?? '',
       (json['lang'] as String?) ?? '',
+      segs,
     );
   }
 }

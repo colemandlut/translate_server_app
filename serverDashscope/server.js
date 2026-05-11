@@ -378,6 +378,11 @@ const path = require('path');
 const FILE_RECOGNIZE_TMP_DIR = '/tmp/file-recognize';
 try { fs.mkdirSync(FILE_RECOGNIZE_TMP_DIR, { recursive: true }); } catch (_) {}
 
+// 临时 URL 跨 machine 路由：Fly 一个 app 跑 N 台机器，token 只在收上传那台
+// 的内存里。把 machine_id 编进 URL，Dashscope 拉文件时若被路由到错误的机器，
+// 我们返回 fly-replay header 让 Fly 把请求转给原机器。
+const FLY_MACHINE_ID = process.env.FLY_MACHINE_ID || '';
+
 // In-memory map of temp-token -> { path, expiresAt }. Cleaned up by the
 // /file-recognize handler when its task is done, with a sweep fallback.
 const _tempFileTokens = new Map();
@@ -478,22 +483,45 @@ async function fetchTranscriptionJson(transcriptionUrl) {
   return await r.json();
 }
 
-// Aggregate Dashscope file-mode transcription JSON into { text, lang }. The
-// response shape is `{ transcripts: [{ text, sentences: [{ text, language? }] }] }`.
-// We pick the dominant per-sentence language for translation targeting.
+// Aggregate Dashscope file-mode transcription JSON.
+// 返回 { text, lang, sentences: [{ beginMs, endMs, text, lang, words }] }
+// Dashscope 的 transcription JSON 结构:
+//   { transcripts: [{ text, sentences: [{ begin_time, end_time, text, language?,
+//                       words: [{ begin_time, end_time, text, punctuation? }] }] }] }
 function aggregateTranscription(json) {
   if (!json || !Array.isArray(json.transcripts) || json.transcripts.length === 0) {
-    return { text: '', lang: '' };
+    return { text: '', lang: '', sentences: [] };
   }
   const langCounts = new Map();
   const lines = [];
+  const sentences = [];
   for (const tr of json.transcripts) {
     const trText = (tr.text || '').trim();
     if (trText) lines.push(trText);
-    const sentences = Array.isArray(tr.sentences) ? tr.sentences : [];
-    for (const s of sentences) {
-      const lang = (s.language || tr.language || '').toLowerCase();
-      if (lang) langCounts.set(lang, (langCounts.get(lang) || 0) + 1);
+    const trLang = (tr.language || '').toLowerCase();
+    const trSents = Array.isArray(tr.sentences) ? tr.sentences : [];
+    for (const s of trSents) {
+      const sText = (s.text || '').trim();
+      if (!sText) continue;
+      const sLang = (s.language || trLang || '').toLowerCase();
+      if (sLang) langCounts.set(sLang, (langCounts.get(sLang) || 0) + 1);
+      // 提取 word 级别时间戳，给客户端做逐字进度。
+      const words = Array.isArray(s.words)
+        ? s.words
+            .map((w) => ({
+              beginMs: typeof w.begin_time === 'number' ? w.begin_time : null,
+              endMs: typeof w.end_time === 'number' ? w.end_time : null,
+              text: ((w.text || '') + (w.punctuation || '')) || '',
+            }))
+            .filter((w) => w.text)
+        : [];
+      sentences.push({
+        beginMs: typeof s.begin_time === 'number' ? s.begin_time : null,
+        endMs: typeof s.end_time === 'number' ? s.end_time : null,
+        text: sText,
+        lang: sLang,
+        words,
+      });
     }
   }
   let bestLang = '';
@@ -501,7 +529,40 @@ function aggregateTranscription(json) {
   for (const [lang, count] of langCounts) {
     if (count > bestCount) { bestLang = lang; bestCount = count; }
   }
-  return { text: lines.join('\n'), lang: bestLang };
+  return { text: lines.join('\n'), lang: bestLang, sentences };
+}
+
+// 并发翻译多个句子，限制并发避免 Google API 速率。
+async function translateSegmentsConcurrent(segments, langA, langB, concurrency = 4) {
+  const results = new Array(segments.length);
+  let idx = 0;
+  const workers = Array.from({ length: Math.min(concurrency, segments.length) }, async () => {
+    while (true) {
+      const i = idx++;
+      if (i >= segments.length) return;
+      const seg = segments[i];
+      // 每个 segment 独立判方向 —— 应对中英混录
+      const dir = detectDirection(seg.lang || detectLang(seg.text), langA, langB);
+      const target = transCode(dir.target);
+      let translated = '';
+      try {
+        translated = await translateTextLong(seg.text, target, 15_000);
+      } catch (e) {
+        console.error(`[file-recognize] seg translate failed (i=${i}):`, e.message);
+      }
+      results[i] = {
+        beginMs: seg.beginMs,
+        endMs: seg.endMs,
+        text: seg.text,
+        translated,
+        spokenLang: dir.spoken,
+        translatedLang: dir.target,
+        words: seg.words || [],
+      };
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 async function handleFileRecognize(req, res) {
@@ -538,7 +599,8 @@ async function handleFileRecognize(req, res) {
   const proto = protoHeader ? protoHeader.split(',')[0].trim() : 'https';
   const host = req.headers['x-forwarded-host'] || req.headers.host;
   if (!host) throw new Error('missing host header');
-  const fileUrl = `${proto}://${host}/tmp-audio/${token}${path.extname(savedPath)}`;
+  const urlBase = FLY_MACHINE_ID ? `${FLY_MACHINE_ID}__${token}` : token;
+  const fileUrl = `${proto}://${host}/tmp-audio/${urlBase}${path.extname(savedPath)}`;
   console.log(`[file-recognize] saved → ${savedPath} (${token}), url=${fileUrl}`);
 
   const langA = fields.langA || 'en-US';
@@ -576,11 +638,13 @@ async function handleFileRecognize(req, res) {
     if (allTranscripts.length === 0) throw new Error('all sub-tasks failed');
 
     const lines = [];
+    const allSentences = [];
     const langCounts = new Map();
     for (const tjson of allTranscripts) {
-      const { text, lang } = aggregateTranscription(tjson);
+      const { text, lang, sentences } = aggregateTranscription(tjson);
       if (text) lines.push(text);
       if (lang) langCounts.set(lang, (langCounts.get(lang) || 0) + 1);
+      for (const s of sentences) allSentences.push(s);
     }
     const overallText = lines.join('\n');
     let dominantLang = '';
@@ -589,21 +653,22 @@ async function handleFileRecognize(req, res) {
     if (!dominantLang && overallText) dominantLang = detectLang(overallText);
 
     const dir = detectDirection(dominantLang, langA, langB);
-    const targetCode = transCode(dir.target);
 
-    let overallTranslated = '';
-    if (overallText) {
-      try {
-        overallTranslated = await translateTextLong(overallText, targetCode, 30_000);
-      } catch (e) {
-        console.error('[file-recognize] translate failed:', e.message);
-        overallTranslated = '';
-      }
-    }
+    // 每个 segment 单独翻译 —— 给客户端做字幕展示
+    console.log(`[file-recognize] translating ${allSentences.length} segments...`);
+    const segments = await translateSegmentsConcurrent(allSentences, langA, langB);
+
+    // overallTranslated = 各 segment 翻译用换行拼起来，保留向后兼容
+    const overallTranslated = segments.map((s) => s.translated || '').filter(Boolean).join('\n');
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ overallText, overallTranslated, lang: dir.spoken }));
-    console.log(`[file-recognize] done: text=${overallText.length}b translated=${overallTranslated.length}b`);
+    res.end(JSON.stringify({
+      overallText,
+      overallTranslated,
+      lang: dir.spoken,
+      segments,
+    }));
+    console.log(`[file-recognize] done: segments=${segments.length} text=${overallText.length}b translated=${overallTranslated.length}b`);
   } finally {
     await cleanup();
   }
@@ -631,9 +696,23 @@ const httpServer = http.createServer((req, res) => {
   }
 
   if (req.method === 'GET' && req.url.startsWith('/tmp-audio/')) {
-    // URL form: /tmp-audio/<token>.<ext>
+    // URL form: /tmp-audio/[<machine_id>__]<token>.<ext>
     const tail = req.url.slice('/tmp-audio/'.length).split('?')[0];
-    const token = tail.split('.')[0];
+    const baseName = tail.split('.')[0];
+    let urlMachineId = '';
+    let token = baseName;
+    if (baseName.includes('__')) {
+      const idx = baseName.indexOf('__');
+      urlMachineId = baseName.slice(0, idx);
+      token = baseName.slice(idx + 2);
+    }
+    // 跨机器路由：本机不是文件持有方，让 Fly replay 到原机器。
+    if (urlMachineId && FLY_MACHINE_ID && urlMachineId !== FLY_MACHINE_ID) {
+      res.setHeader('fly-replay', `instance=${urlMachineId}`);
+      res.writeHead(307);
+      res.end();
+      return;
+    }
     const entry = _tempFileTokens.get(token);
     if (!entry) { res.writeHead(404); res.end(); return; }
     fs.stat(entry.path, (err, stat) => {
