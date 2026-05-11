@@ -365,6 +365,250 @@ class Session {
   }
 }
 
+// ---- File-mode recognition (POST /file-recognize + GET /tmp-audio/:token) ----
+// Whole-recording ASR using Dashscope paraformer-v2 file API (async task).
+// Flow: client uploads m4a → we save to /tmp + expose a one-shot HTTPS URL on
+// this same server → submit task → poll → fetch transcription JSON → Google
+// Translate the aggregated text → return one JSON response.
+const Busboy = require('busboy');
+const fs = require('fs');
+const fsp = require('fs/promises');
+const path = require('path');
+
+const FILE_RECOGNIZE_TMP_DIR = '/tmp/file-recognize';
+try { fs.mkdirSync(FILE_RECOGNIZE_TMP_DIR, { recursive: true }); } catch (_) {}
+
+// In-memory map of temp-token -> { path, expiresAt }. Cleaned up by the
+// /file-recognize handler when its task is done, with a sweep fallback.
+const _tempFileTokens = new Map();
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, entry] of _tempFileTokens) {
+    if (entry.expiresAt < now) {
+      _tempFileTokens.delete(token);
+      fsp.unlink(entry.path).catch(() => {});
+    }
+  }
+}, 60_000).unref();
+
+// translateText with a configurable (longer) timeout — overall-text translation
+// can take a few seconds because the input is much longer than per-utterance.
+function translateTextLong(text, targetLang, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('timeout')), timeoutMs);
+    const body = JSON.stringify({ q: text, target: targetLang, format: 'text' });
+    const req = https.request({
+      hostname: 'translation.googleapis.com',
+      path: `/language/translate/v2?key=${GOOGLE_API_KEY}`,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+      timeout: timeoutMs,
+    }, (res) => {
+      let d = '';
+      res.on('data', (c) => d += c);
+      res.on('end', () => {
+        clearTimeout(timer);
+        try {
+          const j = JSON.parse(d);
+          if (j.error) return reject(new Error(j.error.message));
+          resolve(j.data.translations[0].translatedText);
+        } catch (e) { reject(e); }
+      });
+    });
+    req.on('error', (e) => { clearTimeout(timer); reject(e); });
+    req.on('timeout', () => req.destroy());
+    req.write(body);
+    req.end();
+  });
+}
+
+async function fetchJsonDashscope(url, { method = 'GET', body = null, extraHeaders = {} } = {}) {
+  const headers = {
+    'Authorization': `Bearer ${DASHSCOPE_API_KEY}`,
+    'Content-Type': 'application/json',
+    ...extraHeaders,
+  };
+  if (DASHSCOPE_WORKSPACE_ID) headers['X-DashScope-WorkSpace'] = DASHSCOPE_WORKSPACE_ID;
+  const r = await fetch(url, { method, headers, body });
+  const txt = await r.text();
+  let json;
+  try { json = JSON.parse(txt); } catch (_) { json = { rawText: txt }; }
+  if (!r.ok) {
+    const err = new Error(`HTTP ${r.status}: ${(json && (json.message || json.code)) || txt.slice(0, 200)}`);
+    err.statusCode = r.status;
+    err.body = json;
+    throw err;
+  }
+  return json;
+}
+
+async function submitDashscopeTranscriptionTask(fileUrl, languageHints) {
+  const body = JSON.stringify({
+    model: 'paraformer-v2',
+    input: { file_urls: [fileUrl] },
+    parameters: { language_hints: languageHints, disfluency_removal_enabled: false },
+  });
+  const j = await fetchJsonDashscope(
+    'https://dashscope.aliyuncs.com/api/v1/services/audio/asr/transcription',
+    { method: 'POST', body, extraHeaders: { 'X-DashScope-Async': 'enable' } },
+  );
+  const taskId = j && j.output && j.output.task_id;
+  if (!taskId) throw new Error('no task_id: ' + JSON.stringify(j).slice(0, 200));
+  return taskId;
+}
+
+async function pollDashscopeTask(taskId, { intervalMs = 2000, maxMs = 120_000 } = {}) {
+  const start = Date.now();
+  while (Date.now() - start < maxMs) {
+    const j = await fetchJsonDashscope(`https://dashscope.aliyuncs.com/api/v1/tasks/${taskId}`);
+    const status = j && j.output && j.output.task_status;
+    if (status === 'SUCCEEDED') return j.output;
+    if (status === 'FAILED') {
+      const reason = (j.output && (j.output.message || j.output.code)) || 'task FAILED';
+      throw new Error(reason);
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  throw new Error('dashscope task poll timeout');
+}
+
+async function fetchTranscriptionJson(transcriptionUrl) {
+  const r = await fetch(transcriptionUrl);
+  if (!r.ok) throw new Error(`transcription fetch HTTP ${r.status}`);
+  return await r.json();
+}
+
+// Aggregate Dashscope file-mode transcription JSON into { text, lang }. The
+// response shape is `{ transcripts: [{ text, sentences: [{ text, language? }] }] }`.
+// We pick the dominant per-sentence language for translation targeting.
+function aggregateTranscription(json) {
+  if (!json || !Array.isArray(json.transcripts) || json.transcripts.length === 0) {
+    return { text: '', lang: '' };
+  }
+  const langCounts = new Map();
+  const lines = [];
+  for (const tr of json.transcripts) {
+    const trText = (tr.text || '').trim();
+    if (trText) lines.push(trText);
+    const sentences = Array.isArray(tr.sentences) ? tr.sentences : [];
+    for (const s of sentences) {
+      const lang = (s.language || tr.language || '').toLowerCase();
+      if (lang) langCounts.set(lang, (langCounts.get(lang) || 0) + 1);
+    }
+  }
+  let bestLang = '';
+  let bestCount = 0;
+  for (const [lang, count] of langCounts) {
+    if (count > bestCount) { bestLang = lang; bestCount = count; }
+  }
+  return { text: lines.join('\n'), lang: bestLang };
+}
+
+async function handleFileRecognize(req, res) {
+  const fields = {};
+  let savedPath = null;
+  let token = null;
+
+  await new Promise((resolve, reject) => {
+    let bb;
+    try { bb = Busboy({ headers: req.headers, limits: { fileSize: 50 * 1024 * 1024 } }); }
+    catch (e) { reject(e); return; }
+    bb.on('file', (name, fileStream, info) => {
+      if (name !== 'audio') { fileStream.resume(); return; }
+      token = randomUUID().replace(/-/g, '');
+      const extMatch = (info.filename || '').match(/\.(m4a|aac|mp3|wav|mp4)$/i);
+      const ext = extMatch ? extMatch[0] : '.m4a';
+      savedPath = path.join(FILE_RECOGNIZE_TMP_DIR, `${token}${ext}`);
+      const wstream = fs.createWriteStream(savedPath);
+      fileStream.pipe(wstream);
+      fileStream.on('limit', () => { wstream.destroy(); reject(new Error('file too large (max 50MB)')); });
+      wstream.on('error', reject);
+    });
+    bb.on('field', (name, val) => { fields[name] = val; });
+    bb.on('finish', resolve);
+    bb.on('error', reject);
+    req.pipe(bb);
+  });
+
+  if (!savedPath) throw new Error('missing audio field in multipart');
+
+  _tempFileTokens.set(token, { path: savedPath, expiresAt: Date.now() + 5 * 60_000 });
+
+  const protoHeader = req.headers['x-forwarded-proto'];
+  const proto = protoHeader ? protoHeader.split(',')[0].trim() : 'https';
+  const host = req.headers['x-forwarded-host'] || req.headers.host;
+  if (!host) throw new Error('missing host header');
+  const fileUrl = `${proto}://${host}/tmp-audio/${token}${path.extname(savedPath)}`;
+  console.log(`[file-recognize] saved → ${savedPath} (${token}), url=${fileUrl}`);
+
+  const langA = fields.langA || 'en-US';
+  const langB = fields.langB || 'zh-CN';
+  const hintsSet = new Set();
+  hintsSet.add(langA.split('-')[0].toLowerCase());
+  hintsSet.add(langB.split('-')[0].toLowerCase());
+  hintsSet.add('zh'); hintsSet.add('en'); // hedge against mixed audio
+  const languageHints = [...hintsSet];
+
+  const cleanup = async () => {
+    _tempFileTokens.delete(token);
+    try { await fsp.unlink(savedPath); } catch (_) {}
+  };
+
+  try {
+    console.log(`[file-recognize] submit, hints=${languageHints.join(',')}`);
+    const taskId = await submitDashscopeTranscriptionTask(fileUrl, languageHints);
+    console.log(`[file-recognize] task_id=${taskId}, polling...`);
+    const output = await pollDashscopeTask(taskId);
+    console.log(`[file-recognize] task SUCCEEDED`);
+
+    const results = output.results || [];
+    if (results.length === 0) throw new Error('no transcription results');
+    const allTranscripts = [];
+    for (const r of results) {
+      if (r.subtask_status !== 'SUCCEEDED') {
+        console.warn(`[file-recognize] sub-task ${r.subtask_status}: ${r.message || ''}`);
+        continue;
+      }
+      if (!r.transcription_url) continue;
+      const tjson = await fetchTranscriptionJson(r.transcription_url);
+      allTranscripts.push(tjson);
+    }
+    if (allTranscripts.length === 0) throw new Error('all sub-tasks failed');
+
+    const lines = [];
+    const langCounts = new Map();
+    for (const tjson of allTranscripts) {
+      const { text, lang } = aggregateTranscription(tjson);
+      if (text) lines.push(text);
+      if (lang) langCounts.set(lang, (langCounts.get(lang) || 0) + 1);
+    }
+    const overallText = lines.join('\n');
+    let dominantLang = '';
+    let best = 0;
+    for (const [lang, count] of langCounts) { if (count > best) { dominantLang = lang; best = count; } }
+    if (!dominantLang && overallText) dominantLang = detectLang(overallText);
+
+    const dir = detectDirection(dominantLang, langA, langB);
+    const targetCode = transCode(dir.target);
+
+    let overallTranslated = '';
+    if (overallText) {
+      try {
+        overallTranslated = await translateTextLong(overallText, targetCode, 30_000);
+      } catch (e) {
+        console.error('[file-recognize] translate failed:', e.message);
+        overallTranslated = '';
+      }
+    }
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ overallText, overallTranslated, lang: dir.spoken }));
+    console.log(`[file-recognize] done: text=${overallText.length}b translated=${overallTranslated.length}b`);
+  } finally {
+    await cleanup();
+  }
+}
+
 // ---- HTTP server (translate proxy for on-device clients) + WS upgrade ----
 const http = require('http');
 const httpServer = http.createServer((req, res) => {
@@ -372,6 +616,33 @@ const httpServer = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
+  if (req.method === 'POST' && req.url === '/file-recognize') {
+    handleFileRecognize(req, res).catch((e) => {
+      console.error('[file-recognize] error:', e.message);
+      if (!res.headersSent) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      } else {
+        try { res.end(); } catch (_) {}
+      }
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && req.url.startsWith('/tmp-audio/')) {
+    // URL form: /tmp-audio/<token>.<ext>
+    const tail = req.url.slice('/tmp-audio/'.length).split('?')[0];
+    const token = tail.split('.')[0];
+    const entry = _tempFileTokens.get(token);
+    if (!entry) { res.writeHead(404); res.end(); return; }
+    fs.stat(entry.path, (err, stat) => {
+      if (err) { res.writeHead(404); res.end(); return; }
+      res.writeHead(200, { 'Content-Type': 'audio/mp4', 'Content-Length': stat.size });
+      fs.createReadStream(entry.path).pipe(res);
+    });
+    return;
+  }
 
   if (req.method === 'POST' && req.url === '/translate') {
     let body = '';

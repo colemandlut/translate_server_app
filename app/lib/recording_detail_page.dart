@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'models/recording.dart';
 import 'models/transcript_entry.dart';
 import 'services/recording_store.dart';
+import 'services/file_recognize_client.dart';
 
 class RecordingDetailPage extends StatefulWidget {
   final String sessionId;
@@ -27,6 +28,10 @@ class _RecordingDetailPageState extends State<RecordingDetailPage>
   bool _playing = false;
   bool _playerLoaded = false;
   String? _loadedPath;
+
+  // 整段重识别状态
+  bool _reasrInflight = false;
+  String? _reasrError;
 
   @override
   void initState() {
@@ -168,28 +173,46 @@ class _RecordingDetailPageState extends State<RecordingDetailPage>
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              const Text(
-                '尚未对整段录音重新识别',
-                style: TextStyle(color: Color(0xFF7f8fa6), fontSize: 14),
+              Text(
+                _reasrInflight ? '正在用 Dashscope 重做识别…' : '尚未对整段录音重新识别',
+                style: const TextStyle(color: Color(0xFF7f8fa6), fontSize: 14),
               ),
               const SizedBox(height: 16),
-              ElevatedButton.icon(
-                icon: const Icon(Icons.cloud_upload),
-                label: const Text('用 Dashscope 重做识别'),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFF0f3460),
-                  foregroundColor: const Color(0xFF53a8ff),
+              if (_reasrInflight)
+                const Column(
+                  children: [
+                    SizedBox(
+                      width: 28, height: 28,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 3,
+                        valueColor: AlwaysStoppedAnimation(Color(0xFF53a8ff)),
+                      ),
+                    ),
+                    SizedBox(height: 8),
+                    Text(
+                      '识别中…（约 10-60 秒）',
+                      style: TextStyle(color: Color(0xFF7f8fa6), fontSize: 11),
+                    ),
+                  ],
+                )
+              else
+                ElevatedButton.icon(
+                  icon: const Icon(Icons.cloud_upload),
+                  label: const Text('用 Dashscope 重做识别'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF0f3460),
+                    foregroundColor: const Color(0xFF53a8ff),
+                  ),
+                  onPressed: s.audioPath == null ? null : () => _runReasr(s),
                 ),
-                onPressed: s.audioPath == null
-                    ? null
-                    : () {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(
-                            content: Text('整段重做识别功能将在下个版本上线'),
-                          ),
-                        );
-                      },
-              ),
+              if (_reasrError != null) ...[
+                const SizedBox(height: 12),
+                Text(
+                  _reasrError!,
+                  style: const TextStyle(color: Color(0xFFe74c3c), fontSize: 12),
+                  textAlign: TextAlign.center,
+                ),
+              ],
               if (s.audioPath == null) ...[
                 const SizedBox(height: 12),
                 const Text(
@@ -253,6 +276,63 @@ class _RecordingDetailPageState extends State<RecordingDetailPage>
         ],
       ),
     );
+  }
+
+  Future<void> _runReasr(RecordingSession s) async {
+    if (_reasrInflight) return;
+    if (s.audioPath == null) return;
+    setState(() {
+      _reasrInflight = true;
+      _reasrError = null;
+    });
+    try {
+      final r = await FileRecognizeClient().run(
+        audioPath: s.audioPath!,
+        langA: s.langA,
+        langB: s.langB,
+      );
+      if (r.overallText.isEmpty) {
+        if (!mounted) return;
+        setState(() {
+          _reasrInflight = false;
+          _reasrError = '识别结果为空，请确认录音内容';
+        });
+        return;
+      }
+      final updated = s.copyWith(
+        overallText: r.overallText,
+        overallTranslated: r.overallTranslated,
+      );
+      await _store.update(updated);
+      if (!mounted) return;
+      setState(() {
+        _reasrInflight = false;
+      });
+    } on TimeoutException {
+      if (!mounted) return;
+      setState(() {
+        _reasrInflight = false;
+        _reasrError = '识别超时，请重试';
+      });
+    } on SocketException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _reasrInflight = false;
+        _reasrError = '网络错误：${e.message}';
+      });
+    } on FileRecognizeException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _reasrInflight = false;
+        _reasrError = '服务器错误 ${e.statusCode}：${e.body}';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _reasrInflight = false;
+        _reasrError = '识别失败：$e';
+      });
+    }
   }
 
   Widget _buildSummaryTab(RecordingSession s) {
