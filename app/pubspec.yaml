@@ -80,6 +80,18 @@ flutter:
     - assets/models/multi-stream/decoder-epoch-75-avg-11-chunk-16-left-128.onnx
     - assets/models/multi-stream/joiner-epoch-75-avg-11-chunk-16-left-128.int8.onnx
     - assets/models/multi-stream/tokens.txt
+    - assets/models/zh/encoder.onnx
+    - assets/models/zh/decoder.onnx
+    - assets/models/zh/joiner.onnx
+    - assets/models/zh/tokens.txt
+    - assets/models/en/encoder.onnx
+    - assets/models/en/decoder.onnx
+    - assets/models/en/joiner.onnx
+    - assets/models/en/tokens.txt
+    - assets/models/ja/encoder.ort
+    - assets/models/ja/decoder_merged.ort
+    - assets/models/ja/tokens.txt
+    - assets/models/vad/silero_vad.onnx
 
   # To add assets to your application, add an assets section, like this:
   # assets:

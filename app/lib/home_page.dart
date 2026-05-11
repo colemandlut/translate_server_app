@@ -5,7 +5,8 @@ import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:record/record.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:flutter/services.dart' show MethodChannel, rootBundle;
+import 'package:flutter/services.dart'
+    show MethodChannel, PlatformException, rootBundle;
 import 'package:path_provider/path_provider.dart';
 import 'dart:io';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
@@ -29,8 +30,12 @@ class ServerOption {
   // on-device: skip ws/audio upload, run ASR locally; url is the /translate
   // proxy (HTTPS) used to fetch translations after recognition.
   final bool onDevice;
-  // engine: 'ws' (cloud relay), 'apple' (SFSpeechRecognizer), 'sherpa'
-  // (sherpa-onnx zipformer transducer in the app process).
+  // engine:
+  //   'ws'            cloud relay (Dashscope/Whisper/Google)
+  //   'apple'         Apple SFSpeech + Dashscope cloud secondary + Google translate
+  //   'apple-native'  Apple SFSpeech + Apple Translation framework, no cloud
+  //   'sherpa'        sherpa-onnx 8-lang streaming + Dashscope cloud secondary
+  //   'sherpa-single' sherpa-onnx single-lang (zh/en streaming, ja VAD+offline moonshine)
   final String engine;
   const ServerOption(this.name, this.url,
       {this.onDevice = false, this.engine = 'ws'});
@@ -46,6 +51,12 @@ const _servers = <ServerOption>[
   ServerOption('On-Device (sherpa 8-lang stream + Dashscope re-recog)',
       'https://translate-relay-dashscope.fly.dev',
       onDevice: true, engine: 'sherpa'),
+  ServerOption('On-Device (sherpa single-lang, local only)',
+      'https://translate-relay-dashscope.fly.dev',
+      onDevice: true, engine: 'sherpa-single'),
+  ServerOption('On-Device (Apple ASR + Apple Translation, fully local)',
+      'https://translate-relay-dashscope.fly.dev',
+      onDevice: true, engine: 'apple-native'),
 ];
 
 const _appVersion = 'v1.3.0';
@@ -127,6 +138,12 @@ class _HomePageState extends State<HomePage>
   // Buffer of raw PCM int16 LE bytes for the current utterance, so we can
   // re-recognize on Dashscope after sherpa endpoints.
   final List<Uint8List> _sherpaSegmentPcm = [];
+  // Which sherpa model bundle is currently loaded into _sherpa / _sherpaOffline.
+  // Values: null (none), 'multi' (8-lang), 'zh-single', 'en-single', 'ja-single'.
+  String? _sherpaModelKey;
+  // sherpa-onnx single-lang ja path: offline moonshine + silero VAD.
+  so.OfflineRecognizer? _sherpaOffline;
+  so.VoiceActivityDetector? _vad;
 
   final _scrollController = ScrollController();
   late AnimationController _pulseController;
@@ -135,8 +152,14 @@ class _HomePageState extends State<HomePage>
 
   bool get _isOnDevice => _servers[_selectedServer].onDevice;
   String get _engine => _servers[_selectedServer].engine;
-  bool get _isSherpa => _engine == 'sherpa';
-  bool get _isApple => _engine == 'apple';
+  // Any sherpa-onnx-based engine.
+  bool get _isSherpa => _engine == 'sherpa' || _engine == 'sherpa-single';
+  // Single-lang sherpa: skip cloud secondary, pick model from langA.
+  bool get _isSherpaSingle => _engine == 'sherpa-single';
+  // Any Apple SFSpeech-based engine.
+  bool get _isApple => _engine == 'apple' || _engine == 'apple-native';
+  // Apple-native: skip Dashscope cloud secondary; use Apple Translation framework.
+  bool get _isAppleNative => _engine == 'apple-native';
 
   @override
   void initState() {
@@ -158,6 +181,7 @@ class _HomePageState extends State<HomePage>
   void dispose() {
     _stopListening();
     _disconnectFromServer();
+    _disposeSherpaModels();
     _recorder.dispose();
     _pulseController.dispose();
     _scrollController.dispose();
@@ -537,6 +561,12 @@ class _HomePageState extends State<HomePage>
       });
       _appleAudioHandlerInstalled = true;
     }
+    // Apple-native engine: kick off language pack prepare/download now (on
+    // Start), so the iOS "Download language" prompt appears up front rather
+    // than mid-utterance when the first translation tries to fire.
+    if (_isAppleNative) {
+      unawaited(_prepareApple(_langA.code, _langB.code));
+    }
 
     try {
       await _restartOnDeviceListen();
@@ -621,9 +651,10 @@ class _HomePageState extends State<HomePage>
       });
       // Cloud secondary: pick up this utterance's PCM (delivered just before
       // the final result by the patched plugin) and ship it to Dashscope.
+      // Apple-native engine is "fully local" — skip the cloud upgrade.
       final pcm = _pendingApplePcm;
       _pendingApplePcm = null;
-      if (pcm != null && pcm.length >= 320 * 2) {
+      if (!_isAppleNative && pcm != null && pcm.length >= 320 * 2) {
         final localText = text;
         () async {
           try {
@@ -655,7 +686,51 @@ class _HomePageState extends State<HomePage>
     });
   }
 
+  // Dart-side bridge to Apple's Translation framework (iOS 18.0+). Returns
+  // null if the framework isn't available (older iOS) or the call fails.
+  static const _appleTranslateChannel =
+      MethodChannel('app.translate/apple_translation');
+
+  Future<String?> _translateApple(
+      String text, String sourceBcp47, String targetBcp47) async {
+    try {
+      final result = await _appleTranslateChannel.invokeMethod<String>(
+        'translate',
+        {'text': text, 'source': sourceBcp47, 'target': targetBcp47},
+      );
+      if (result == null || result.isEmpty) return null;
+      return result;
+    } on PlatformException catch (e) {
+      debugPrint('apple translate: ${e.code} ${e.message}');
+      return null;
+    } catch (e) {
+      debugPrint('apple translate: $e');
+      return null;
+    }
+  }
+
+  // Ask iOS to prepare (download if needed) the source→target language pair so
+  // the iOS Translation download prompt appears now, when the user taps Start,
+  // rather than on the first inflight translation mid-utterance.
+  Future<void> _prepareApple(String sourceBcp47, String targetBcp47) async {
+    try {
+      await _appleTranslateChannel.invokeMethod<void>(
+        'prepare',
+        {'source': sourceBcp47, 'target': targetBcp47},
+      );
+    } on PlatformException catch (e) {
+      debugPrint('apple prepare: ${e.code} ${e.message}');
+    } catch (e) {
+      debugPrint('apple prepare: $e');
+    }
+  }
+
   Future<String?> _translateOnDevice(String text, String targetBcp47) async {
+    // Apple-native engine routes translation through the iOS Translation
+    // framework instead of the cloud /translate proxy.
+    if (_isAppleNative) {
+      return _translateApple(text, _langA.code, targetBcp47);
+    }
     // For sherpa engine the selected server URL points at the dashscope proxy
     // anyway; fall through to the same dashscope /translate endpoint.
     final base = _servers[_selectedServer].url;
@@ -687,55 +762,190 @@ class _HomePageState extends State<HomePage>
     return file.path;
   }
 
-  Future<so.OnlineRecognizer?> _initSherpa() async {
-    if (_sherpa != null) return _sherpa;
+  // Pick which sherpa model bundle to load given the current engine + langA.
+  // sherpa-single picks zh/en streaming or ja offline+VAD; sherpa always uses
+  // the 8-lang multi-stream model.
+  String _resolveSherpaModelKey() {
+    if (!_isSherpaSingle) return 'multi';
+    final code = _langA.code.toLowerCase();
+    if (code.startsWith('zh')) return 'zh-single';
+    if (code.startsWith('en')) return 'en-single';
+    if (code.startsWith('ja')) return 'ja-single';
+    return 'multi';
+  }
+
+  // Tear down whichever sherpa recognizer + VAD is currently loaded so we can
+  // swap to a different model bundle. Safe to call repeatedly.
+  void _disposeSherpaModels() {
+    try { _sherpaStream?.free(); } catch (_) {}
+    _sherpaStream = null;
+    try { _sherpa?.free(); } catch (_) {}
+    _sherpa = null;
+    try { _sherpaOffline?.free(); } catch (_) {}
+    _sherpaOffline = null;
+    try { _vad?.free(); } catch (_) {}
+    _vad = null;
+    _sherpaModelKey = null;
+  }
+
+  // Load (or swap to) the sherpa model bundle implied by the current engine +
+  // langA. Returns true on success. Safe to call multiple times; if the wanted
+  // bundle is already loaded, it's a no-op.
+  Future<bool> _ensureSherpa() async {
+    final wanted = _resolveSherpaModelKey();
+    final alreadyLoaded = (_sherpaModelKey == wanted) &&
+        (wanted == 'ja-single'
+            ? (_sherpaOffline != null && _vad != null)
+            : _sherpa != null);
+    if (alreadyLoaded) return true;
     if (_sherpaInitInflight) {
       while (_sherpaInitInflight) {
         await Future.delayed(const Duration(milliseconds: 80));
       }
-      return _sherpa;
+      return _sherpaModelKey == wanted;
     }
+    _disposeSherpaModels();
     _sherpaInitInflight = true;
     try {
-      final encoder = await _copyAssetToFile(
-          'assets/models/multi-stream/encoder-epoch-75-avg-11-chunk-16-left-128.int8.onnx',
-          'sh-multi-encoder.onnx');
-      final decoder = await _copyAssetToFile(
-          'assets/models/multi-stream/decoder-epoch-75-avg-11-chunk-16-left-128.onnx',
-          'sh-multi-decoder.onnx');
-      final joiner = await _copyAssetToFile(
-          'assets/models/multi-stream/joiner-epoch-75-avg-11-chunk-16-left-128.int8.onnx',
-          'sh-multi-joiner.onnx');
-      final tokens = await _copyAssetToFile(
-          'assets/models/multi-stream/tokens.txt', 'sh-multi-tokens.txt');
       so.initBindings();
-      _sherpa = so.OnlineRecognizer(so.OnlineRecognizerConfig(
-        model: so.OnlineModelConfig(
-          transducer: so.OnlineTransducerModelConfig(
-            encoder: encoder, decoder: decoder, joiner: joiner,
-          ),
-          tokens: tokens,
-          modelType: 'zipformer2',
-          numThreads: 2,
-        ),
-        decodingMethod: 'greedy_search',
-        enableEndpoint: true,
-        rule1MinTrailingSilence: 2.0,
-        rule2MinTrailingSilence: 0.8,
-        rule3MinUtteranceLength: 20,
-      ));
+      switch (wanted) {
+        case 'multi':
+          await _loadSherpaMulti();
+          break;
+        case 'zh-single':
+          await _loadSherpaSingleStreaming(
+            langKey: 'zh',
+            assetPrefix: 'assets/models/zh',
+            cachePrefix: 'sh-zh-single',
+          );
+          break;
+        case 'en-single':
+          await _loadSherpaSingleStreaming(
+            langKey: 'en',
+            assetPrefix: 'assets/models/en',
+            cachePrefix: 'sh-en-single',
+          );
+          break;
+        case 'ja-single':
+          await _loadSherpaJaOfflineWithVad();
+          break;
+      }
+      _sherpaModelKey = wanted;
+      return true;
     } catch (e) {
-      debugPrint('sherpa init: $e');
+      debugPrint('sherpa ensure $wanted: $e');
+      _disposeSherpaModels();
+      return false;
     } finally {
       _sherpaInitInflight = false;
     }
-    return _sherpa;
+  }
+
+  Future<void> _loadSherpaMulti() async {
+    final encoder = await _copyAssetToFile(
+        'assets/models/multi-stream/encoder-epoch-75-avg-11-chunk-16-left-128.int8.onnx',
+        'sh-multi-encoder.onnx');
+    final decoder = await _copyAssetToFile(
+        'assets/models/multi-stream/decoder-epoch-75-avg-11-chunk-16-left-128.onnx',
+        'sh-multi-decoder.onnx');
+    final joiner = await _copyAssetToFile(
+        'assets/models/multi-stream/joiner-epoch-75-avg-11-chunk-16-left-128.int8.onnx',
+        'sh-multi-joiner.onnx');
+    final tokens = await _copyAssetToFile(
+        'assets/models/multi-stream/tokens.txt', 'sh-multi-tokens.txt');
+    _sherpa = so.OnlineRecognizer(so.OnlineRecognizerConfig(
+      model: so.OnlineModelConfig(
+        transducer: so.OnlineTransducerModelConfig(
+          encoder: encoder, decoder: decoder, joiner: joiner,
+        ),
+        tokens: tokens,
+        modelType: 'zipformer2',
+        numThreads: 2,
+      ),
+      decodingMethod: 'greedy_search',
+      enableEndpoint: true,
+      rule1MinTrailingSilence: 2.0,
+      rule2MinTrailingSilence: 0.8,
+      rule3MinUtteranceLength: 20,
+    ));
+  }
+
+  Future<void> _loadSherpaSingleStreaming({
+    required String langKey,
+    required String assetPrefix,
+    required String cachePrefix,
+  }) async {
+    final encoder = await _copyAssetToFile(
+        '$assetPrefix/encoder.onnx', '$cachePrefix-encoder.onnx');
+    final decoder = await _copyAssetToFile(
+        '$assetPrefix/decoder.onnx', '$cachePrefix-decoder.onnx');
+    final joiner = await _copyAssetToFile(
+        '$assetPrefix/joiner.onnx', '$cachePrefix-joiner.onnx');
+    final tokens = await _copyAssetToFile(
+        '$assetPrefix/tokens.txt', '$cachePrefix-tokens.txt');
+    // Both zh-14M and en-20M were exported with the
+    // `pruned_transducer_stateless7_streaming` icefall recipe — that's the
+    // original zipformer (v1), not zipformer2. Passing 'zipformer2' here
+    // mismatches model parameter shapes and crashes native code.
+    _sherpa = so.OnlineRecognizer(so.OnlineRecognizerConfig(
+      model: so.OnlineModelConfig(
+        transducer: so.OnlineTransducerModelConfig(
+          encoder: encoder, decoder: decoder, joiner: joiner,
+        ),
+        tokens: tokens,
+        modelType: 'zipformer',
+        numThreads: 2,
+      ),
+      decodingMethod: 'greedy_search',
+      enableEndpoint: true,
+      rule1MinTrailingSilence: 1.4,
+      rule2MinTrailingSilence: 0.6,
+      rule3MinUtteranceLength: 20,
+    ));
+  }
+
+  // Japanese single-lang: Moonshine v2 (offline) gated by Silero VAD endpoints.
+  // No live partials — each VAD segment finalize emits one card.
+  Future<void> _loadSherpaJaOfflineWithVad() async {
+    final encoder = await _copyAssetToFile(
+        'assets/models/ja/encoder.ort', 'sh-ja-encoder.ort');
+    final merged = await _copyAssetToFile(
+        'assets/models/ja/decoder_merged.ort', 'sh-ja-decoder_merged.ort');
+    final tokens = await _copyAssetToFile(
+        'assets/models/ja/tokens.txt', 'sh-ja-tokens.txt');
+    final vadModel = await _copyAssetToFile(
+        'assets/models/vad/silero_vad.onnx', 'sh-vad-silero.onnx');
+    _sherpaOffline = so.OfflineRecognizer(so.OfflineRecognizerConfig(
+      model: so.OfflineModelConfig(
+        moonshine: so.OfflineMoonshineModelConfig(
+          encoder: encoder, mergedDecoder: merged,
+        ),
+        tokens: tokens,
+        numThreads: 2,
+        modelType: 'moonshine',
+      ),
+      decodingMethod: 'greedy_search',
+    ));
+    _vad = so.VoiceActivityDetector(
+      config: so.VadModelConfig(
+        sileroVad: so.SileroVadModelConfig(
+          model: vadModel,
+          threshold: 0.5,
+          minSilenceDuration: 0.4,
+          minSpeechDuration: 0.25,
+          maxSpeechDuration: 12.0,
+        ),
+        numThreads: 1,
+        debug: false,
+      ),
+      bufferSizeInSeconds: 30.0,
+    );
   }
 
   Future<void> _startSherpaListening() async {
     setState(() => _status = 'Loading model...');
-    final rec = await _initSherpa();
-    if (rec == null) {
+    final ok = await _ensureSherpa();
+    if (!ok) {
       _showAlert('Sherpa unavailable', 'Failed to load model.');
       setState(() => _status = 'Standby');
       return;
@@ -746,10 +956,15 @@ class _HomePageState extends State<HomePage>
       setState(() => _status = 'Standby');
       return;
     }
-    _sherpaStream = rec.createStream();
+    final modelKey = _sherpaModelKey ?? 'multi';
+    final isJaOffline = modelKey == 'ja-single';
+    if (!isJaOffline) {
+      _sherpaStream = _sherpa!.createStream();
+    }
     _sherpaLastEmitted = '';
     _sherpaLastTranslateAt = 0;
     _sherpaSegmentPcm.clear();
+    try { _vad?.clear(); } catch (_) {}
 
     final audioStream = await _recorder.startStream(RecordConfig(
       encoder: AudioEncoder.pcm16bits,
@@ -762,17 +977,64 @@ class _HomePageState extends State<HomePage>
     _sessionId = 'sess_${_sessionStartedAt!.millisecondsSinceEpoch}';
     await _audioWriter.start(sessionId: _sessionId!);
 
-    _sherpaAudioSub = audioStream.listen(_onSherpaAudio);
+    _sherpaAudioSub = audioStream.listen(
+      isJaOffline ? _onSherpaJaAudio : _onSherpaAudio,
+    );
 
     _sessionStartTranscriptCount = _transcripts.length;
+    final label = switch (modelKey) {
+      'zh-single' => 'sherpa-onnx zh-14M',
+      'en-single' => 'sherpa-onnx en-20M',
+      'ja-single' => 'sherpa-onnx ja moonshine + VAD',
+      _ => 'sherpa-onnx 8-lang',
+    };
     setState(() {
       _isListening = true;
-      _status = 'Listening (sherpa-onnx 8-lang)';
+      _status = 'Listening ($label)';
       _liveText = '';
       _liveTranslation = '';
     });
     _pulseController.repeat(reverse: true);
     WakelockPlus.enable();
+  }
+
+  // Japanese single-lang path: feed PCM into VAD; when a speech segment closes,
+  // run the offline Moonshine recognizer on it and emit one final card.
+  void _onSherpaJaAudio(Uint8List data) {
+    _audioWriter.write(data);
+    final vad = _vad;
+    final rec = _sherpaOffline;
+    if (vad == null || rec == null) return;
+    final bytes = Uint8List.fromList(data);
+    final int16 = Int16List.view(bytes.buffer);
+    final samples = Float32List(int16.length);
+    for (var i = 0; i < int16.length; i++) {
+      samples[i] = int16[i] / 32768.0;
+    }
+    try {
+      vad.acceptWaveform(samples);
+    } catch (e) {
+      debugPrint('vad accept: $e');
+      return;
+    }
+    while (!vad.isEmpty()) {
+      final seg = vad.front();
+      vad.pop();
+      if (seg.samples.isEmpty) continue;
+      try {
+        final stream = rec.createStream();
+        stream.acceptWaveform(samples: seg.samples, sampleRate: 16000);
+        rec.decode(stream);
+        final text = rec.getResult(stream).text.trim();
+        stream.free();
+        if (text.isNotEmpty) {
+          final entryId = DateTime.now().millisecondsSinceEpoch.toString();
+          _emitSherpaFinal(text, entryId: entryId);
+        }
+      } catch (e) {
+        debugPrint('ja offline recognize: $e');
+      }
+    }
   }
 
   void _onSherpaAudio(Uint8List data) {
@@ -803,7 +1065,10 @@ class _HomePageState extends State<HomePage>
         _emitSherpaFinal(localText, entryId: entryId);
         final segmentPcm = _flattenChunks(_sherpaSegmentPcm);
         _sherpaSegmentPcm.clear();
-        _runSecondaryRecognize(segmentPcm, entryId, localText: localText);
+        // sherpa-single is "local only" — skip Dashscope cloud upgrade.
+        if (!_isSherpaSingle) {
+          _runSecondaryRecognize(segmentPcm, entryId, localText: localText);
+        }
       } else {
         _sherpaSegmentPcm.clear();
       }
@@ -997,7 +1262,39 @@ class _HomePageState extends State<HomePage>
     _sherpaAudioSub?.cancel();
     _sherpaAudioSub = null;
     try { await _recorder.stop(); } catch (_) {}
-    // Flush trailing audio: ask the recognizer to finalize whatever's in flight.
+    if (_sherpaModelKey == 'ja-single') {
+      // Drain any final VAD segment(s) before tearing down.
+      try {
+        final vad = _vad;
+        final rec = _sherpaOffline;
+        if (vad != null && rec != null) {
+          while (!vad.isEmpty()) {
+            final seg = vad.front();
+            vad.pop();
+            if (seg.samples.isEmpty) continue;
+            try {
+              final st = rec.createStream();
+              st.acceptWaveform(samples: seg.samples, sampleRate: 16000);
+              rec.decode(st);
+              final text = rec.getResult(st).text.trim();
+              st.free();
+              if (text.isNotEmpty) {
+                _emitSherpaFinal(
+                  text,
+                  entryId: DateTime.now().millisecondsSinceEpoch.toString(),
+                );
+              }
+            } catch (e) {
+              debugPrint('ja drain recognize: $e');
+            }
+          }
+        }
+      } catch (_) {}
+      _sherpaSegmentPcm.clear();
+      return;
+    }
+    // Streaming path (multi / zh-single / en-single): flush trailing audio so
+    // the recognizer finalizes whatever's still in flight.
     final rec = _sherpa;
     final stream = _sherpaStream;
     if (rec != null && stream != null) {
@@ -1012,7 +1309,9 @@ class _HomePageState extends State<HomePage>
         _emitSherpaFinal(localText, entryId: entryId);
         final segmentPcm = _flattenChunks(_sherpaSegmentPcm);
         _sherpaSegmentPcm.clear();
-        _runSecondaryRecognize(segmentPcm, entryId, localText: localText);
+        if (!_isSherpaSingle) {
+          _runSecondaryRecognize(segmentPcm, entryId, localText: localText);
+        }
       }
     }
     _sherpaStream?.free();
@@ -1193,12 +1492,13 @@ class _HomePageState extends State<HomePage>
                     setState(() => _selectedServer = v);
                     _disconnectFromServer();
                     _connectToServer();
-                    // Pre-warm sherpa-onnx model on selection so the first
-                    // Start tap doesn't pay the load cost. _initSherpa is
-                    // idempotent and never releases, so subsequent selections
-                    // are no-ops.
-                    if (_servers[v].engine == 'sherpa') {
-                      _initSherpa();
+                    // Pre-warm sherpa-onnx so the first Start tap doesn't
+                    // pay the model load cost. _ensureSherpa picks the right
+                    // bundle (multi-stream vs single-lang) and swaps if the
+                    // current bundle doesn't match.
+                    final eng = _servers[v].engine;
+                    if (eng == 'sherpa' || eng == 'sherpa-single') {
+                      _ensureSherpa();
                     }
                   },
                   title: Text(_servers[i].name,
