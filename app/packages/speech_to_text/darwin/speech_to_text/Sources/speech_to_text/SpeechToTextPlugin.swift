@@ -702,7 +702,7 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
             // listen() swaps in a new SFSpeechAudioBufferRecognitionRequest;
             // the tap just appends to whichever one is current.
             guard let self = self else { return }
-            SpeechToTextPlugin.applyInputGain(buffer: buffer, gain: SpeechToTextPlugin.inputGain)
+            SpeechToTextPlugin.applyInputGain(buffer: buffer)
             self.currentRequest?.append(buffer)
             self.updateSoundLevel(buffer: buffer)
             self.broadcastResampledPCM(buffer: buffer)
@@ -748,20 +748,47 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
     }
   }
 
-  // Software gain applied to mic buffers before SFSpeechRecognizer sees them.
-  // Apple's recognizer has its own VAD that drops quiet speech; multiplying by a
-  // fixed factor compensates without touching iOS's input AGC. 2.0 ≈ +6dB.
-  static let inputGain: Float = 2.0
+  // Adaptive software gain (simple AGC) applied to mic buffers before
+  // SFSpeechRecognizer sees them. The old fixed ×2.0 wasn't enough for
+  // far-field speech: distant voices stayed under Apple's internal VAD
+  // threshold and got dropped. We track a slow-decaying running peak and
+  // steer the gain so speech peaks land near agcTargetPeak — quiet/distant
+  // input gets boosted by up to maxInputGain (+18dB), loud close-mic input
+  // backs the gain off so it doesn't clip.
+  static let maxInputGain: Float = 8.0
+  static let minInputGain: Float = 1.0
+  static let agcTargetPeak: Float = 0.7
+  // Halves in ~2s of quiet at ~47 buffers/s so gain recovers after a loud
+  // burst without pumping on every pause.
+  static let agcPeakDecay: Float = 0.993
+  private static var agcRunningPeak: Float = 0.1
+  private static var agcGain: Float = 2.0
 
-  static func applyInputGain(buffer: AVAudioPCMBuffer, gain: Float) {
-    if gain == 1.0 { return }
+  static func applyInputGain(buffer: AVAudioPCMBuffer) {
     guard let channelData = buffer.floatChannelData else { return }
     let channelCount = Int(buffer.format.channelCount)
     let frameLength = Int(buffer.frameLength)
+    if frameLength == 0 { return }
+
+    var peak: Float = 0
     for ch in 0..<channelCount {
       let samples = channelData[ch]
       for i in 0..<frameLength {
-        let amplified = samples[i] * gain
+        peak = max(peak, abs(samples[i]))
+      }
+    }
+    // Rise instantly on loud input (prevents clipping), decay slowly.
+    agcRunningPeak = max(peak, agcRunningPeak * agcPeakDecay)
+
+    let desired = min(
+      maxInputGain, max(minInputGain, agcTargetPeak / max(agcRunningPeak, 0.001)))
+    // Smooth per-buffer so gain changes don't produce audible steps.
+    agcGain += (desired - agcGain) * 0.2
+
+    for ch in 0..<channelCount {
+      let samples = channelData[ch]
+      for i in 0..<frameLength {
+        let amplified = samples[i] * agcGain
         samples[i] = max(-1.0, min(1.0, amplified))
       }
     }

@@ -1,5 +1,6 @@
 import AVFoundation
 import Flutter
+import Speech
 import SwiftUI
 import UIKit
 #if canImport(Translation)
@@ -22,6 +23,8 @@ import Translation
       AudioFileWriter.register(with: writerRegistrar)
       let translatorRegistrar = engineBridge.pluginRegistry.registrar(forPlugin: "AppleTranslator")!
       AppleTranslator.register(with: translatorRegistrar)
+      let fileAsrRegistrar = engineBridge.pluginRegistry.registrar(forPlugin: "AppleFileRecognizer")!
+      AppleFileRecognizer.register(with: fileAsrRegistrar)
     }
   }
 }
@@ -340,3 +343,455 @@ fileprivate struct TranslateRunnerView: View {
 }
 
 #endif
+
+/// On-device full-file speech recognition + language probing, bridged to
+/// Dart over `app.translate/apple_file_asr`. Powers the fully-local
+/// "整段重识别" path:
+///   detect    — trim the head of the file (~10s) and run it through an
+///               on-device recognizer per candidate locale; the locale whose
+///               final transcription has the highest duration-weighted
+///               confidence wins.
+///   recognize — run the whole file through the winning locale, returning
+///               word-level timestamps so Dart can rebuild subtitle cards.
+///
+/// Inlined here (same pattern as AudioFileWriter / AppleTranslator) so we
+/// don't have to touch the Runner pbxproj.
+@available(iOS 13.0, *)
+public class AppleFileRecognizer: NSObject, FlutterPlugin {
+  static let channelName = "app.translate/apple_file_asr"
+  private static var heldChannel: FlutterMethodChannel?
+
+  // Strong refs while recognition runs; SFSpeechRecognizer must outlive its
+  // task or the task silently dies.
+  private var activeRecognizers: [UUID: SFSpeechRecognizer] = [:]
+  private var activeTasks: [UUID: SFSpeechRecognitionTask] = [:]
+
+  public static func register(with registrar: FlutterPluginRegistrar) {
+    let channel = FlutterMethodChannel(
+      name: channelName, binaryMessenger: registrar.messenger())
+    let instance = AppleFileRecognizer()
+    channel.setMethodCallHandler { [weak instance] call, result in
+      instance?.handle(call, result: result)
+    }
+    heldChannel = channel
+    registrar.publish(instance)
+    instance.runDebugSelfTestIfRequested()
+  }
+
+  // Headless debug hook: drop Documents/debug_reasr.json
+  //   {"file": "recordings/sess_xxx.m4a", "locale": "ja-JP"}
+  // into the app container (e.g. via devicectl copy) and launch the app —
+  // recognition runs automatically and NSLogs everything, no UI taps needed.
+  // The trigger file is deleted so it fires once.
+  private func runDebugSelfTestIfRequested() {
+    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+      guard let self = self,
+            let docs = FileManager.default.urls(
+              for: .documentDirectory, in: .userDomainMask).first else { return }
+      let cfg = docs.appendingPathComponent("debug_reasr.json")
+      guard let data = try? Data(contentsOf: cfg),
+            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let rel = obj["file"] as? String else { return }
+      try? FileManager.default.removeItem(at: cfg)
+      let audio = docs.appendingPathComponent(rel)
+      let locale = obj["locale"] as? String ?? "ja-JP"
+      NSLog("[FileASR-SelfTest] file=%@ locale=%@", audio.path, locale)
+      SFSpeechRecognizer.requestAuthorization { st in
+        guard st == .authorized else {
+          NSLog("[FileASR-SelfTest] speech permission missing")
+          return
+        }
+        self.recognizeFile(audio, locale: locale, startSeconds: 0,
+                           maxSeconds: nil, timeout: 120) { res in
+          switch res {
+          case .success(let ws):
+            NSLog("[FileASR-SelfTest] SUCCESS %d words", ws.count)
+            for w in ws.prefix(100) {
+              NSLog("[FileASR-SelfTest] %.2f-%.2f %@", w.begin, w.end, w.text)
+            }
+          case .failure(let e):
+            NSLog("[FileASR-SelfTest] FAIL %@", e.localizedDescription)
+          }
+        }
+      }
+    }
+  }
+
+  public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    switch call.method {
+    case "detect":
+      handleDetect(call, result: result)
+    case "recognize":
+      handleRecognize(call, result: result)
+    case "availability":
+      handleAvailability(call, result: result)
+    default:
+      result(FlutterMethodNotImplemented)
+    }
+  }
+
+  // Per-locale on-device readiness, so Dart can prompt the user to download
+  // the dictation language pack BEFORE running a recognition that would
+  // silently score zero. Values: ok / no_ondevice / unavailable / no_recognizer.
+  private func handleAvailability(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    guard let args = call.arguments as? [String: Any],
+          let candidates = args["candidates"] as? [String] else {
+      result(FlutterError(code: "bad_args", message: "candidates required", details: nil))
+      return
+    }
+    var out: [String: String] = [:]
+    for loc in candidates {
+      guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: loc)) else {
+        out[loc] = "no_recognizer"
+        continue
+      }
+      if !recognizer.isAvailable {
+        out[loc] = "unavailable"
+      } else if !recognizer.supportsOnDeviceRecognition {
+        out[loc] = "no_ondevice"
+      } else {
+        out[loc] = "ok"
+      }
+    }
+    result(out)
+  }
+
+  private func handleDetect(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    guard let args = call.arguments as? [String: Any],
+          let path = args["path"] as? String,
+          let candidates = args["candidates"] as? [String], !candidates.isEmpty else {
+      result(FlutterError(code: "bad_args", message: "path/candidates required", details: nil))
+      return
+    }
+    SFSpeechRecognizer.requestAuthorization { [weak self] status in
+      guard let self = self else { return }
+      guard status == .authorized else {
+        DispatchQueue.main.async {
+          result(FlutterError(code: "no_permission",
+                              message: "Speech recognition not authorized", details: nil))
+        }
+        return
+      }
+      let srcURL = URL(fileURLWithPath: path)
+      // Skip leading silence, probe up to 10s of actual speech straight from
+      // the file (buffer-fed — no temp clip export needed).
+      let onset = self.findSpeechOnset(in: srcURL)
+      let total = Self.audioDuration(of: srcURL)
+      let probeSeconds = min(10.0, max(1.0, total - onset))
+      var scores: [String: Double] = [:]
+      var errors: [String: String] = [:]
+      func reply() {
+        let best = scores.max { $0.value < $1.value }
+        // All-zero scores mean no candidate produced anything usable —
+        // return "" instead of an arbitrary dictionary winner and let Dart
+        // surface the per-locale errors.
+        let locale = (best != nil && best!.value > 0) ? best!.key : ""
+        DispatchQueue.main.async {
+          result(["locale": locale, "scores": scores, "errors": errors])
+        }
+      }
+      func probe(_ idx: Int) {
+        if idx >= candidates.count { reply(); return }
+        let loc = candidates[idx]
+        self.recognizeFile(srcURL, locale: loc, startSeconds: onset,
+                           maxSeconds: 10.0, timeout: 30) { res in
+          switch res {
+          case .success(let ws):
+            // Coverage-first score: how much of the probe window did this
+            // recognizer turn into words? A wrong-language recognizer
+            // "hears" few/no words, the right one covers most of it.
+            // Confidence only modulates (0.35 base weight) because on-device
+            // results routinely report confidence == 0 for every segment.
+            var num = 0.0
+            for w in ws {
+              num += (w.end - w.begin) * (0.35 + 0.65 * w.confidence)
+            }
+            scores[loc] = num / probeSeconds
+          case .failure(let err):
+            scores[loc] = 0
+            errors[loc] = err.localizedDescription
+          }
+          probe(idx + 1)
+        }
+      }
+      probe(0)
+    }
+  }
+
+  private func handleRecognize(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    guard let args = call.arguments as? [String: Any],
+          let path = args["path"] as? String,
+          let locale = args["locale"] as? String else {
+      result(FlutterError(code: "bad_args", message: "path/locale required", details: nil))
+      return
+    }
+    SFSpeechRecognizer.requestAuthorization { [weak self] status in
+      guard let self = self else { return }
+      guard status == .authorized else {
+        DispatchQueue.main.async {
+          result(FlutterError(code: "no_permission",
+                              message: "Speech recognition not authorized", details: nil))
+        }
+        return
+      }
+      self.recognizeFile(URL(fileURLWithPath: path), locale: locale,
+                         startSeconds: 0, maxSeconds: nil, timeout: 600) { res in
+        DispatchQueue.main.async {
+          switch res {
+          case .success(let ws):
+            var words: [[String: Any]] = []
+            for w in ws {
+              words.append([
+                "beginMs": Int(w.begin * 1000),
+                "endMs": Int(w.end * 1000),
+                "text": w.text,
+              ])
+            }
+            result([
+              "text": ws.map { $0.text }.joined(separator: " "),
+              "words": words,
+            ])
+          case .failure(let err):
+            result(FlutterError(code: "recognize_failed",
+                                message: err.localizedDescription, details: nil))
+          }
+        }
+      }
+    }
+  }
+
+  // Run one on-device recognition over a file region by decoding it with
+  // AVAudioFile and feeding buffers to SFSpeechAudioBufferRecognitionRequest —
+  // the same pipeline the (working) live mic path uses. The URL-request API
+  // (SFSpeechURLRecognitionRequest) silently returned empty results in
+  // requiresOnDeviceRecognition mode, which broke both language probing and
+  // full-file recognition.
+  //
+  // Segment timestamps are relative to the fed region, so callers that need
+  // file-relative times must pass startSeconds = 0.
+  private func recognizeFile(
+    _ url: URL, locale: String, startSeconds: Double, maxSeconds: Double?,
+    timeout: TimeInterval,
+    completion: @escaping (Result<[FileASRWord], Error>) -> Void
+  ) {
+    guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: locale)),
+          recognizer.isAvailable else {
+      completion(.failure(Self.err("recognizer unavailable for \(locale)")))
+      return
+    }
+    guard recognizer.supportsOnDeviceRecognition else {
+      completion(.failure(Self.err(
+        "on-device recognition unsupported for \(locale) — download the keyboard dictation language in iOS Settings")))
+      return
+    }
+    let request = SFSpeechAudioBufferRecognitionRequest()
+    request.requiresOnDeviceRecognition = true
+    request.shouldReportPartialResults = true
+    request.taskHint = .dictation
+    if #available(iOS 16.0, *) {
+      request.addsPunctuation = true
+    }
+    let id = UUID()
+    // On-device dictation restarts its transcription at every internal
+    // utterance boundary (pause): bestTranscription RESETS instead of
+    // growing, and the isFinal callback only carries the LAST utterance —
+    // usually the trailing silence, i.e. empty. So we accumulate: when a
+    // callback's transcription no longer starts where the previous one did,
+    // the previous utterance is done — commit its segments and keep going.
+    // The final transcript = committed segments + the last in-flight ones.
+    var committed: [FileASRWord] = []
+    var current: SFTranscription?
+    func words(of t: SFTranscription) -> [FileASRWord] {
+      t.segments.compactMap { seg in
+        let txt = seg.substring.trimmingCharacters(in: .whitespaces)
+        if txt.isEmpty { return nil }
+        return FileASRWord(
+          begin: seg.timestamp, end: seg.timestamp + seg.duration,
+          confidence: Double(seg.confidence), text: txt)
+      }
+    }
+    func collectAll() -> [FileASRWord] {
+      committed + (current.map(words(of:)) ?? [])
+    }
+    // finish() may fire from the recognizer's queue or the timeout timer;
+    // serialize through main so the guard flag isn't racy.
+    var finished = false
+    let finish: (Result<[FileASRWord], Error>) -> Void = { [weak self] r in
+      DispatchQueue.main.async {
+        if finished { return }
+        finished = true
+        self?.activeTasks[id]?.cancel()
+        self?.activeTasks.removeValue(forKey: id)
+        self?.activeRecognizers.removeValue(forKey: id)
+        completion(r)
+      }
+    }
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self else { return }
+      self.activeRecognizers[id] = recognizer
+      NSLog("[FileASR] start locale=%@ start=%.1fs max=%@", locale, startSeconds,
+            maxSeconds.map { String($0) } ?? "all")
+      let task = recognizer.recognitionTask(with: request) { res, err in
+        if let res = res {
+          let t = res.bestTranscription
+          let firstTs = t.segments.first?.timestamp ?? -1
+          // Observed callback pattern per utterance:
+          //   1. growing partials, timestamps PROVISIONAL (t0 ≈ 0)
+          //   2. one RE-TIMED result: same text, timestamps corrected to
+          //      absolute stream positions (t0 jumps)
+          //   3. next utterance's partials start over with short text
+          // So: same-ish text + t0 jump ⇒ commit the RE-TIMED version (the
+          // one with correct absolute times) and clear; text collapse ⇒ new
+          // utterance began without a re-time event — commit the provisional
+          // current as fallback.
+          if let cur = current, let curFirst = cur.segments.first {
+            let curLen = cur.formattedString.count
+            let newLen = t.formattedString.count
+            let t0Changed = abs(firstTs - curFirst.timestamp) > 0.01
+            if t0Changed && !t.segments.isEmpty
+                && newLen >= max(1, (curLen * 8) / 10) {
+              committed += words(of: t)
+              current = nil
+            } else if t.segments.isEmpty || newLen < max(2, curLen / 2) {
+              committed += words(of: cur)
+              current = t.segments.isEmpty ? nil : t
+            } else {
+              current = t
+            }
+          } else {
+            current = t.segments.isEmpty ? nil : t
+          }
+          if res.isFinal {
+            finish(.success(collectAll()))
+            return
+          }
+        }
+        if let err = err {
+          NSLog("[FileASR] %@ error: %@", locale, err.localizedDescription)
+          let all = collectAll()
+          if all.isEmpty {
+            finish(.failure(err))
+          } else {
+            finish(.success(all))
+          }
+        }
+      }
+      self.activeTasks[id] = task
+
+      // Decode + feed off the main thread. Throttled to ~20× realtime: the
+      // on-device recognizer has been seen dropping ALL audio when a file is
+      // blasted in one burst followed by an immediate endAudio.
+      DispatchQueue.global(qos: .userInitiated).async {
+        var fedFrames: Int64 = 0
+        do {
+          let file = try AVAudioFile(forReading: url)
+          let fmt = file.processingFormat
+          let sr = fmt.sampleRate
+          if startSeconds > 0 {
+            file.framePosition = AVAudioFramePosition(startSeconds * sr)
+          }
+          var remaining = maxSeconds.map { AVAudioFramePosition($0 * sr) }
+            ?? AVAudioFramePosition.max
+          let chunkFrames = AVAudioFrameCount(sr * 0.5)
+          while remaining > 0 {
+            // Bound by the file's own length so we stop cleanly at EOF
+            // instead of tripping AVAudioFile's read-past-end exception.
+            let left = file.length - file.framePosition
+            if left <= 0 { break }
+            let toRead = AVAudioFrameCount(
+              min(AVAudioFramePosition(chunkFrames), min(remaining, left)))
+            guard let buf = AVAudioPCMBuffer(
+              pcmFormat: fmt, frameCapacity: toRead) else { break }
+            try file.read(into: buf, frameCount: toRead)
+            if buf.frameLength == 0 { break }
+            request.append(buf)
+            fedFrames += Int64(buf.frameLength)
+            remaining -= AVAudioFramePosition(buf.frameLength)
+            // 0.5s of audio per 25ms wall clock ≈ 20× realtime.
+            usleep(25_000)
+          }
+          NSLog("[FileASR] %@ fed %.1fs, endAudio", locale,
+                Double(fedFrames) / sr)
+        } catch {
+          NSLog("[FileASR] %@ feed error after %lld frames: %@", locale,
+                fedFrames, error.localizedDescription)
+        }
+        request.endAudio()
+      }
+
+      DispatchQueue.main.asyncAfter(deadline: .now() + timeout) {
+        let all = collectAll()
+        if all.isEmpty {
+          finish(.failure(Self.err("recognition timed out after \(Int(timeout))s")))
+        } else {
+          finish(.success(all))
+        }
+      }
+    }
+  }
+
+  // One recognized word/token with file-region-relative timing.
+  struct FileASRWord {
+    let begin: Double
+    let end: Double
+    let confidence: Double
+    let text: String
+  }
+
+  // Decoded length of an audio file in seconds (0 on failure).
+  private static func audioDuration(of url: URL) -> Double {
+    guard let file = try? AVAudioFile(forReading: url) else { return 0 }
+    let sr = file.processingFormat.sampleRate
+    guard sr > 0 else { return 0 }
+    return Double(file.length) / sr
+  }
+
+  // Energy-based VAD: find where speech starts so the language probe doesn't
+  // burn its window on leading silence. Scans 100ms RMS hops with an adaptive
+  // noise floor; "speech" = 3 consecutive hops above threshold. Returns the
+  // onset in seconds (backed off 0.25s), or 0 on any failure.
+  private func findSpeechOnset(in url: URL) -> Double {
+    guard let file = try? AVAudioFile(forReading: url) else { return 0 }
+    let fmt = file.processingFormat
+    let hop = AVAudioFrameCount(fmt.sampleRate * 0.1)
+    guard hop > 0,
+          let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: hop) else {
+      return 0
+    }
+    var noiseFloor = Double.greatestFiniteMagnitude
+    var run = 0
+    var idx = 0
+    // Cap the scan at 10 minutes so a pathological file can't stall detect.
+    while idx < 6000 {
+      buf.frameLength = 0
+      do { try file.read(into: buf, frameCount: hop) } catch { break }
+      let n = Int(buf.frameLength)
+      if n == 0 { break }
+      guard let ch = buf.floatChannelData?[0] else { break }
+      var sum = 0.0
+      for i in 0..<n {
+        let v = Double(ch[i])
+        sum += v * v
+      }
+      let rms = (sum / Double(n)).squareRoot()
+      noiseFloor = min(noiseFloor, max(rms, 0.0005))
+      let threshold = max(noiseFloor * 4, 0.01)
+      if rms > threshold {
+        run += 1
+        if run >= 3 {
+          return max(0, Double(idx - run + 1) * 0.1 - 0.25)
+        }
+      } else {
+        run = 0
+      }
+      idx += 1
+    }
+    return 0
+  }
+
+  private static func err(_ msg: String) -> NSError {
+    return NSError(
+      domain: "AppleFileRecognizer", code: -1,
+      userInfo: [NSLocalizedDescriptionKey: msg])
+  }
+}

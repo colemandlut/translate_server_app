@@ -9,6 +9,8 @@ import 'models/transcript_segment.dart';
 import 'services/recording_store.dart';
 import 'services/file_recognize_client.dart';
 import 'services/audio_path_resolver.dart';
+import 'services/apple_file_recognize.dart';
+import 'services/apple_translation.dart';
 
 class RecordingDetailPage extends StatefulWidget {
   final String sessionId;
@@ -41,8 +43,11 @@ class _RecordingDetailPageState extends State<RecordingDetailPage>
   bool _playerLoaded = false;
   String? _loadedPath;
 
-  // 整段重识别状态
+  // 整段重识别状态。_reasrLocal 区分 Dashscope 云端 / Apple 本地两条链路，
+  // 只影响 loading 文案。_reasrStage 是本地链路的阶段提示。
   bool _reasrInflight = false;
+  bool _reasrLocal = false;
+  String _reasrStage = '';
   String? _reasrError;
 
   // 字幕跟随播放：当前激活的 segment 索引（按播放位置算）；GlobalKey list
@@ -293,18 +298,22 @@ class _RecordingDetailPageState extends State<RecordingDetailPage>
   }
 
   Widget _buildReasrLoading() {
-    return const Center(
+    final title = _reasrLocal ? '正在本地识别（Apple）…' : '正在用 Dashscope 重做识别…';
+    final subtitle = _reasrLocal
+        ? (_reasrStage.isEmpty ? '语言检测 + 识别 + 翻译全程本地' : _reasrStage)
+        : '识别中…（约 10-60 秒）';
+    return Center(
       child: Padding(
-        padding: EdgeInsets.all(24),
+        padding: const EdgeInsets.all(24),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             Text(
-              '正在用 Dashscope 重做识别…',
-              style: TextStyle(color: Color(0xFF7f8fa6), fontSize: 14),
+              title,
+              style: const TextStyle(color: Color(0xFF7f8fa6), fontSize: 14),
             ),
-            SizedBox(height: 16),
-            SizedBox(
+            const SizedBox(height: 16),
+            const SizedBox(
               width: 28,
               height: 28,
               child: CircularProgressIndicator(
@@ -312,10 +321,10 @@ class _RecordingDetailPageState extends State<RecordingDetailPage>
                 valueColor: AlwaysStoppedAnimation(Color(0xFF53a8ff)),
               ),
             ),
-            SizedBox(height: 8),
+            const SizedBox(height: 8),
             Text(
-              '识别中…（约 10-60 秒）',
-              style: TextStyle(color: Color(0xFF7f8fa6), fontSize: 11),
+              subtitle,
+              style: const TextStyle(color: Color(0xFF7f8fa6), fontSize: 11),
             ),
           ],
         ),
@@ -337,6 +346,16 @@ class _RecordingDetailPageState extends State<RecordingDetailPage>
               style: TextStyle(color: Color(0xFF7f8fa6), fontSize: 14),
             ),
             const SizedBox(height: 16),
+            ElevatedButton.icon(
+              icon: const Icon(Icons.phone_iphone),
+              label: const Text('本地重识别（自动检测语言）'),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF0f3460),
+                foregroundColor: const Color(0xFF6ee7a0),
+              ),
+              onPressed: hasAudio ? () => _runLocalReasr(s) : null,
+            ),
+            const SizedBox(height: 10),
             ElevatedButton.icon(
               icon: const Icon(Icons.cloud_upload),
               label: const Text('用 Dashscope 重做识别'),
@@ -383,16 +402,32 @@ class _RecordingDetailPageState extends State<RecordingDetailPage>
         if (i == segs.length) {
           return Padding(
             padding: const EdgeInsets.only(top: 8, bottom: 16),
-            child: Center(
-              child: TextButton.icon(
-                icon: const Icon(Icons.refresh,
-                    size: 16, color: Color(0xFF7f8fa6)),
-                label: const Text(
-                  '重新识别',
-                  style: TextStyle(color: Color(0xFF7f8fa6), fontSize: 12),
+            child: Wrap(
+              alignment: WrapAlignment.center,
+              spacing: 12,
+              children: [
+                TextButton.icon(
+                  icon: const Icon(Icons.phone_iphone,
+                      size: 16, color: Color(0xFF7f8fa6)),
+                  label: const Text(
+                    '本地重识别',
+                    style: TextStyle(color: Color(0xFF7f8fa6), fontSize: 12),
+                  ),
+                  onPressed: _resolvedAudioPath == null
+                      ? null
+                      : () => _runLocalReasr(s),
                 ),
-                onPressed: _resolvedAudioPath == null ? null : () => _runReasr(s),
-              ),
+                TextButton.icon(
+                  icon: const Icon(Icons.refresh,
+                      size: 16, color: Color(0xFF7f8fa6)),
+                  label: const Text(
+                    'Dashscope 重识别',
+                    style: TextStyle(color: Color(0xFF7f8fa6), fontSize: 12),
+                  ),
+                  onPressed:
+                      _resolvedAudioPath == null ? null : () => _runReasr(s),
+                ),
+              ],
             ),
           );
         }
@@ -578,16 +613,30 @@ class _RecordingDetailPageState extends State<RecordingDetailPage>
             ),
           ),
           const SizedBox(height: 16),
-          Center(
-            child: TextButton.icon(
-              icon: const Icon(Icons.refresh,
-                  size: 16, color: Color(0xFF7f8fa6)),
-              label: const Text(
-                '重新识别',
-                style: TextStyle(color: Color(0xFF7f8fa6), fontSize: 12),
+          Wrap(
+            alignment: WrapAlignment.center,
+            spacing: 12,
+            children: [
+              TextButton.icon(
+                icon: const Icon(Icons.phone_iphone,
+                    size: 16, color: Color(0xFF7f8fa6)),
+                label: const Text(
+                  '本地重识别',
+                  style: TextStyle(color: Color(0xFF7f8fa6), fontSize: 12),
+                ),
+                onPressed:
+                    s.audioPath == null ? null : () => _runLocalReasr(s),
               ),
-              onPressed: s.audioPath == null ? null : () => _runReasr(s),
-            ),
+              TextButton.icon(
+                icon: const Icon(Icons.refresh,
+                    size: 16, color: Color(0xFF7f8fa6)),
+                label: const Text(
+                  'Dashscope 重识别',
+                  style: TextStyle(color: Color(0xFF7f8fa6), fontSize: 12),
+                ),
+                onPressed: s.audioPath == null ? null : () => _runReasr(s),
+              ),
+            ],
           ),
         ],
       ),
@@ -600,6 +649,7 @@ class _RecordingDetailPageState extends State<RecordingDetailPage>
     if (abs == null) return;
     setState(() {
       _reasrInflight = true;
+      _reasrLocal = false;
       _reasrError = null;
     });
     try {
@@ -650,6 +700,194 @@ class _RecordingDetailPageState extends State<RecordingDetailPage>
         _reasrInflight = false;
         _reasrError = '识别失败：$e';
       });
+    }
+  }
+
+  // 翻译目标：检测到的语言 = 语言对的一边 → 翻到另一边；两边都不是
+  // （比如 zh/en 对里检测出 ja）→ 翻到 langA（用户主语言）。
+  static String _pickTargetLang(String detected, String langA, String langB) {
+    String p(String c) => c.split('-')[0].toLowerCase();
+    if (p(detected) == p(langA)) return langB;
+    if (p(detected) == p(langB)) return langA;
+    return langA;
+  }
+
+  // 缺听写语言包时的提示框。canContinue 为 true 时允许只用已下载的语言
+  // 继续；返回 true 表示用户选择继续。
+  Future<bool> _promptMissingDictation(
+      List<String> missing, bool canContinue) async {
+    const names = {'zh-CN': '中文', 'en-US': 'English', 'ja-JP': '日本語'};
+    final list = missing.map((c) => '• ${names[c] ?? c}（$c）').join('\n');
+    final r = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF16213e),
+        title: const Text('缺少本地听写语言包',
+            style: TextStyle(color: Color(0xFFe0e0ff), fontSize: 16)),
+        content: Text(
+          '以下语言的 iOS 听写语言包未下载，本地识别无法使用：\n\n$list\n\n'
+          '请到 设置 → 通用 → 键盘 → 听写 中下载后重试。',
+          style: const TextStyle(color: Color(0xFF9aa5c4), fontSize: 13, height: 1.5),
+        ),
+        actions: [
+          if (canContinue)
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('仍用已下载语言继续',
+                  style: TextStyle(color: Color(0xFF53a8ff))),
+            ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text(canContinue ? '取消' : '知道了',
+                style: const TextStyle(color: Color(0xFF7f8fa6))),
+          ),
+        ],
+      ),
+    );
+    return r == true;
+  }
+
+  // 本地整段重识别：语言探测 → on-device 识别 → 按停顿分句 → Apple 本地
+  // 翻译。全程不联网（语言包已下载的前提下）。
+  Future<void> _runLocalReasr(RecordingSession s) async {
+    if (_reasrInflight) return;
+    final abs = _resolvedAudioPath;
+    if (abs == null) return;
+
+    const candidates = ['zh-CN', 'en-US', 'ja-JP'];
+    final rec = AppleFileRecognizer();
+    // 先查听写语言包：缺了就当场弹框要求下载，而不是探测阶段静默 0 分。
+    var usable = candidates;
+    try {
+      final avail = await rec.availability(candidates);
+      final missing =
+          candidates.where((c) => avail[c] != 'ok').toList();
+      if (missing.isNotEmpty) {
+        usable = candidates.where((c) => avail[c] == 'ok').toList();
+        if (!mounted) return;
+        final proceed =
+            await _promptMissingDictation(missing, usable.isNotEmpty);
+        if (!proceed || usable.isEmpty) return;
+      }
+    } on AppleFileRecognizeException catch (e) {
+      debugPrint('availability check failed: ${e.message}');
+    }
+
+    setState(() {
+      _reasrInflight = true;
+      _reasrLocal = true;
+      _reasrStage = '正在检测说话语言…';
+      _reasrError = null;
+    });
+    void fail(String msg) {
+      if (!mounted) return;
+      setState(() {
+        _reasrInflight = false;
+        _reasrError = msg;
+      });
+    }
+
+    try {
+      final det = await rec.detect(abs, usable);
+      debugPrint('local reasr detect: locale=${det.locale} '
+          'scores=${det.scores} errors=${det.errors}');
+
+      // 探测有结果 → 按分数降序试（0 分的跳过）；探测全 0 分 → 不放弃，
+      // 按 langA → langB → 其余 的顺序逐语言整段试。整段音频比 10s 探测
+      // 窗口信息多得多，经常能救回来。
+      final List<String> attemptOrder;
+      if (det.locale != null) {
+        attemptOrder = det.ranked
+            .where((c) => (det.scores[c] ?? 0) > 0)
+            .toList();
+      } else {
+        attemptOrder = [
+          ...usable.where((c) => c == s.langA),
+          ...usable.where((c) => c == s.langB && c != s.langA),
+          ...usable.where((c) => c != s.langA && c != s.langB),
+        ];
+        if (mounted) {
+          setState(() => _reasrStage = '语言检测无结果，逐语言尝试中…');
+        }
+      }
+
+      String detected = det.locale ?? attemptOrder.first;
+      ({String text, List<TranscriptWord> words})? r;
+      final tried = <String>[];
+      final recogErrors = <String, String>{};
+      for (final cand in attemptOrder) {
+        tried.add(cand);
+        if (mounted) {
+          setState(() => _reasrStage = tried.length == 1
+              ? (det.locale != null
+                  ? '检测到 $cand，整段识别中…'
+                  : '尝试 $cand 整段识别中…')
+              : '${tried[tried.length - 2]} 结果为空，改用 $cand 重试…');
+        }
+        try {
+          final attempt = await rec.recognize(abs, cand);
+          if (attempt.words.isNotEmpty) {
+            detected = cand;
+            r = attempt;
+            break;
+          }
+        } on AppleFileRecognizeException catch (e) {
+          debugPrint('local reasr recognize($cand): ${e.message}');
+          recogErrors[cand] = e.message;
+        }
+      }
+      if (r == null) {
+        final errText = [
+          ...det.errors.entries.map((e) => '探测 ${e.key}: ${e.value}'),
+          ...recogErrors.entries.map((e) => '识别 ${e.key}: ${e.value}'),
+        ].join('\n');
+        fail('识别结果为空（已尝试：${tried.join('、')}）。'
+            '请确认录音内容，或检查对应语言的听写语言包是否已下载。'
+            '${errText.isEmpty ? '' : '\n\n$errText'}');
+        return;
+      }
+      final target = _pickTargetLang(detected, s.langA, s.langB);
+      final rawSegs = AppleFileRecognizer.groupWords(
+        r.words,
+        spokenLang: detected,
+        translatedLang: target,
+      );
+
+      if (mounted) {
+        setState(() => _reasrStage = '本地翻译中（$detected → $target）…');
+      }
+      // 语言包缺失时这里会弹系统下载框。
+      await AppleTranslation.prepare(detected, target);
+      final segs = <TranscriptSegment>[];
+      for (final seg in rawSegs) {
+        final t = await AppleTranslation.translate(seg.text, detected, target);
+        segs.add(TranscriptSegment(
+          beginMs: seg.beginMs,
+          endMs: seg.endMs,
+          text: seg.text,
+          translated: t ?? '',
+          spokenLang: detected,
+          translatedLang: target,
+          words: seg.words,
+        ));
+      }
+
+      final updated = s.copyWith(
+        overallText: segs.map((e) => e.text).join('\n'),
+        overallTranslated: segs.map((e) => e.translated).join('\n'),
+        overallSegments: segs,
+      );
+      await _store.update(updated);
+      if (!mounted) return;
+      setState(() {
+        _reasrInflight = false;
+      });
+    } on AppleFileRecognizeException catch (e) {
+      fail(e.code == 'no_permission'
+          ? '没有语音识别权限，请在系统设置里授权'
+          : '本地识别失败：${e.message}');
+    } catch (e) {
+      fail('本地识别失败：$e');
     }
   }
 

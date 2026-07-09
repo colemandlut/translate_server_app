@@ -5,8 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:record/record.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:flutter/services.dart'
-    show MethodChannel, PlatformException, rootBundle;
+import 'package:flutter/services.dart' show MethodChannel, rootBundle;
 import 'package:path_provider/path_provider.dart';
 import 'dart:io';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
@@ -22,6 +21,8 @@ import 'models/recording.dart';
 import 'services/recording_store.dart';
 import 'services/audio_file_writer.dart';
 import 'services/audio_path_resolver.dart';
+import 'services/apple_translation.dart';
+import 'services/apple_file_recognize.dart';
 import 'recordings_list_page.dart';
 
 class ServerOption {
@@ -83,7 +84,9 @@ class _HomePageState extends State<HomePage>
   String _liveText = '';
   String _liveTranslation = '';
   String _status = 'Connecting...';
-  int _selectedServer = 3; // 3 = On-Device (Apple Speech) — default
+  // 6 = On-Device (Apple ASR + Apple Translation, fully local) — default:
+  // no network for either recognition or translation.
+  int _selectedServer = 6;
   String get _serverUrl => _servers[_selectedServer].url;
 
   final _recorder = AudioRecorder();
@@ -561,11 +564,26 @@ class _HomePageState extends State<HomePage>
       });
       _appleAudioHandlerInstalled = true;
     }
-    // Apple-native engine: kick off language pack prepare/download now (on
-    // Start), so the iOS "Download language" prompt appears up front rather
-    // than mid-utterance when the first translation tries to fire.
+    // Apple-native engine: verify the dictation pack for the spoken language
+    // is on the device (otherwise on-device ASR silently returns nothing),
+    // then kick off translation language pack prepare/download so the iOS
+    // "Download language" prompt appears up front rather than mid-utterance.
     if (_isAppleNative) {
-      unawaited(_prepareApple(_langA.code, _langB.code));
+      try {
+        final avail =
+            await AppleFileRecognizer().availability([_langA.code]);
+        if (avail[_langA.code] != 'ok') {
+          _showAlert(
+            '缺少听写语言包',
+            '${_langA.name}（${_langA.code}）的 iOS 听写语言包未下载，'
+                '本地识别无法工作。\n请到 设置 → 通用 → 键盘 → 听写 中下载后重试。',
+          );
+          return;
+        }
+      } catch (e) {
+        debugPrint('availability check: $e');
+      }
+      unawaited(AppleTranslation.prepare(_langA.code, _langB.code));
     }
 
     try {
@@ -686,50 +704,11 @@ class _HomePageState extends State<HomePage>
     });
   }
 
-  // Dart-side bridge to Apple's Translation framework (iOS 18.0+). Returns
-  // null if the framework isn't available (older iOS) or the call fails.
-  static const _appleTranslateChannel =
-      MethodChannel('app.translate/apple_translation');
-
-  Future<String?> _translateApple(
-      String text, String sourceBcp47, String targetBcp47) async {
-    try {
-      final result = await _appleTranslateChannel.invokeMethod<String>(
-        'translate',
-        {'text': text, 'source': sourceBcp47, 'target': targetBcp47},
-      );
-      if (result == null || result.isEmpty) return null;
-      return result;
-    } on PlatformException catch (e) {
-      debugPrint('apple translate: ${e.code} ${e.message}');
-      return null;
-    } catch (e) {
-      debugPrint('apple translate: $e');
-      return null;
-    }
-  }
-
-  // Ask iOS to prepare (download if needed) the source→target language pair so
-  // the iOS Translation download prompt appears now, when the user taps Start,
-  // rather than on the first inflight translation mid-utterance.
-  Future<void> _prepareApple(String sourceBcp47, String targetBcp47) async {
-    try {
-      await _appleTranslateChannel.invokeMethod<void>(
-        'prepare',
-        {'source': sourceBcp47, 'target': targetBcp47},
-      );
-    } on PlatformException catch (e) {
-      debugPrint('apple prepare: ${e.code} ${e.message}');
-    } catch (e) {
-      debugPrint('apple prepare: $e');
-    }
-  }
-
   Future<String?> _translateOnDevice(String text, String targetBcp47) async {
     // Apple-native engine routes translation through the iOS Translation
     // framework instead of the cloud /translate proxy.
     if (_isAppleNative) {
-      return _translateApple(text, _langA.code, targetBcp47);
+      return AppleTranslation.translate(text, _langA.code, targetBcp47);
     }
     // For sherpa engine the selected server URL points at the dashscope proxy
     // anyway; fall through to the same dashscope /translate endpoint.
